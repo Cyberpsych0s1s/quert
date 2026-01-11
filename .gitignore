@@ -1,14 +1,11 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# Binaries
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
+# Test binary
 *.test
 
 # Code coverage profiles and other test artifacts
@@ -17,7 +14,7 @@ coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (remove the comment below to include it)
+# Dependency directories
 # vendor/
 
 *.sh
@@ -27,11 +24,9 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
 .env
 
-# md files
-
+.md
 
 # Editor/IDE
 # .idea/
@@ -43,7 +38,6 @@ dist/
 build/
 
 # Compiled binaries without extension (Unix/Linux/macOS executables)
-# This catches executables in specific directories
 /bin/*
 !/bin/.gitkeep
 /examples/*/main
@@ -51,13 +45,6 @@ build/
 /examples/link_collector/link_collector
 /examples/domain_crawler/domain_crawler
 /examples/quick_harvest/quick_harvest
-
-# Alternative approach: ignore all files without extension in specific dirs
-# Uncomment these if you prefer this method:
-# /bin/[!.]*
-# /examples/*/[!.]*
-# !/examples/*/*.go
-# !/examples/*/*.md
 
 # Crawler output files
 collected_links*.txt
@@ -75,15 +62,10 @@ profiles/
 .DS_Store
 Thumbs.db
 
-# Docker-related (removed since we don't use Docker)
-# docker-compose.yml was removed
-# Dockerfile was removed
-
-# Log files
 *.log
 logs/
 
-# Backup files
+# Backup
 *.bak
 *.backup
 *~

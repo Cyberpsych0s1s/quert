@@ -404,7 +404,8 @@ func IsRetryableError(err error, retryableErrors []error) bool {
 		return true
 	}
 
-	// Looking for "no such host" errors (dnsErr.Temporary() is false)
+	// Check for temporary DNS errors (e.g., server failure, timeout).
+	// Note: "No such host" errors are permanent (Temporary() is false) and will NOT be retried.
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) && dnsErr.Temporary() {
 		return true
@@ -501,4 +502,19 @@ type middlewareChain struct {
 
 func (m *middlewareChain) RoundTrip(req *http.Request) (*http.Response, error) {
 	return m.Middleware.RoundTrip(req, m.Next)
+}
+
+func DefaultHTTPConfig() *config.HTTPConfig {
+	return &config.HTTPConfig{
+		MaxIdleConnections:        1000,
+		MaxIdleConnectionsPerHost: 100,
+		IdleConnectionTimeout:     90 * time.Second,
+		DisableKeepAlives:         false,
+		Timeout:                   30 * time.Second,
+		DialTimeout:               5 * time.Second,
+		TlsHandshakeTimeout:       10 * time.Second,
+		ResponseHeaderTimeout:     10 * time.Second,
+		DisableCompression:        false,
+		AcceptEncoding:            "gzip, deflate",
+	}
 }

@@ -65,11 +65,9 @@ func TestCrawlerWithLocalServer(t *testing.T) {
 	if err := engine.Start(ctx); err != nil {
 		t.Fatalf("Failed to start crawler engine: %v", err)
 	}
-	defer engine.Stop()
 
 	results := make([]*CrawlResult, 0)
 	var wg sync.WaitGroup
-	//resultsDone := make(chan bool)
 
 	// Start result collection goroutine
 	wg.Add(1)
@@ -89,7 +87,6 @@ func TestCrawlerWithLocalServer(t *testing.T) {
 			}
 		}
 	}()
-	wg.Wait()
 
 	// Submit crawl jobs
 	for _, seedURL := range crawlerConfig.SeedURLs {
@@ -109,13 +106,14 @@ func TestCrawlerWithLocalServer(t *testing.T) {
 		}
 	}
 
-	// Wait for a bit to allow crawling
-	// Not an ideal solution
 	time.Sleep(5 * time.Second)
 
+	// Stop the engine. This closes the Results channel.
 	if err := engine.Stop(); err != nil {
 		t.Errorf("Error stopping engine: %v", err)
 	}
+
+	wg.Wait()
 
 	// Print final metrics
 	metrics := engine.GetMetrics()

@@ -22,7 +22,7 @@ Keep it friendly:
 
 1. Fork and clone:
 ```bash
-git clone https://github.com/YOUR_USERNAME/quert.git
+git clone https://github.com/almahr1/quert.git
 cd quert
 ```
 

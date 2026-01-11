@@ -91,7 +91,7 @@ type DedupConfig struct {
 
 // StorageConfig holds storage backend settings
 type StorageConfig struct {
-	Type                  string        `mapstructure:"type" yaml:"type" json:"type"` // type is a keyword lol
+	Type                  string        `mapstructure:"type" yaml:"type" json:"type"` // Storage backend type (e.g., "file", "postgres", "redis")
 	Path                  string        `mapstructure:"path" yaml:"path" json:"path"`
 	BatchSize             int           `mapstructure:"batch_size" yaml:"batch_size" json:"batch_size"`
 	Compression           bool          `mapstructure:"compression" yaml:"compression" json:"compression"`

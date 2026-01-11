@@ -1,13 +1,13 @@
-// Package robots provides robots.txt fetching, caching, and permission checking functionality
-// for ethical web crawling according to the Robots Exclusion Standard.
 package robots
 
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -17,41 +17,37 @@ import (
 	"github.com/temoto/robotstxt"
 )
 
-// CacheEntry represents a cached robots.txt entry with expiration
 type CacheEntry struct {
 	Robots    *robotstxt.RobotsData
 	FetchedAt time.Time
 	ExpiresAt time.Time
 }
 
-// Parser handles robots.txt fetching, caching, and permission checking
 type Parser struct {
 	HTTPClient *client.HTTPClient
 	Cache      map[string]*CacheEntry
 	CacheMutex sync.RWMutex
-	CacheTTL   time.Duration // Time To Live
+	CacheTTL   time.Duration
 	UserAgent  string
-	FetchMutex map[string]*sync.Mutex // Per-host fetch mutex to prevent concurrent requests
-	MutexLock  sync.Mutex             // Protects fetchMutex map
+
+	// Replaced potentially infinite map with fixed-size sharded locks
+	lockShards [256]sync.Mutex
 }
 
-// Config holds configuration for the robots.txt parser
 type Config struct {
 	UserAgent   string
-	CacheTTL    time.Duration // Time To Live (default: 24hrs)
+	CacheTTL    time.Duration
 	HTTPTimeout time.Duration
-	MaxSize     int64 // (default: 500KB)
+	MaxSize     int64
 }
 
-// PermissionResult represents the result of a permission check
 type PermissionResult struct {
 	Allowed      bool
 	CrawlDelay   time.Duration
-	DisallowedBy string   // Rule that disallowed the URL (empty if allowed)
-	Sitemaps     []string // Sitemap URLs found in robots.txt
+	DisallowedBy string
+	Sitemaps     []string
 }
 
-// FetchResult represents the result of fetching robots.txt
 type FetchResult struct {
 	Success      bool
 	Robots       *robotstxt.RobotsData
@@ -60,7 +56,6 @@ type FetchResult struct {
 	FetchTime    time.Duration
 }
 
-// NewParser creates a new robots.txt parser with the given configuration and HTTP client
 func NewParser(Config Config, HTTPClient *client.HTTPClient) *Parser {
 	if Config.UserAgent == "" {
 		Config.UserAgent = "*"
@@ -72,7 +67,7 @@ func NewParser(Config Config, HTTPClient *client.HTTPClient) *Parser {
 		Config.HTTPTimeout = 30 * time.Second
 	}
 	if Config.MaxSize <= 0 {
-		Config.MaxSize = 500 * 1024 // 500KB
+		Config.MaxSize = 500 * 1024
 	}
 
 	return &Parser{
@@ -81,47 +76,61 @@ func NewParser(Config Config, HTTPClient *client.HTTPClient) *Parser {
 		CacheMutex: sync.RWMutex{},
 		CacheTTL:   Config.CacheTTL,
 		UserAgent:  Config.UserAgent,
-		FetchMutex: make(map[string]*sync.Mutex),
-		MutexLock:  sync.Mutex{},
+		// lockShards is zero-initialized automatically
 	}
 }
 
-// IsAllowed checks if a URL is allowed to be crawled according to robots.txt
-// This is the main function that crawlers will use
 func (P *Parser) IsAllowed(Ctx context.Context, RawURL string) (*PermissionResult, error) {
 	if RawURL == "" {
 		return nil, fmt.Errorf("empty URL provided")
 	}
-	Host, Err := frontier.ExtractHostFromURL(RawURL)
-	if Err != nil {
-		return nil, fmt.Errorf("failed to extract host from URL %q: %w", RawURL, Err)
+
+	// Fix: Parse URL to get path for robots check
+	u, err := url.Parse(RawURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse URL: %w", err)
 	}
+
+	// Extract host from parsed URL or fallback to helper
+	Host := u.Host
+	if Host == "" {
+		var err error
+		Host, err = frontier.ExtractHostFromURL(RawURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract host from URL %q: %w", RawURL, err)
+		}
+	}
+
 	Robots, Err := P.GetRobots(Ctx, Host)
 	if Err != nil {
-		// If we can't fetch robots.txt, be permissive and allow crawling
-		return &PermissionResult{
-			Allowed:      true,
-			CrawlDelay:   0,
-			DisallowedBy: "",
-			Sitemaps:     []string{},
-		}, nil
+		return nil, fmt.Errorf("robots.txt unavailable (fail closed): %w", Err)
 	}
-	Allowed := Robots.TestAgent(RawURL, P.UserAgent)
+
+	pathQuery := u.Path
+	if u.RawQuery != "" {
+		pathQuery += "?" + u.RawQuery
+	}
+	if pathQuery == "" {
+		pathQuery = "/"
+	}
+
+	Allowed := Robots.TestAgent(pathQuery, P.UserAgent)
+
 	var CrawlDelay time.Duration
 	if Group := Robots.FindGroup(P.UserAgent); Group != nil {
-		// CrawlDelay in robotstxt library is time.Duration in nanoseconds
-		// Convert back to seconds by dividing by time.Second, then multiply back to get clean seconds
 		if Group.CrawlDelay > 0 {
 			Seconds := int64(Group.CrawlDelay / time.Second)
 			CrawlDelay = time.Duration(Seconds) * time.Second
 		}
 	}
+
 	var Sitemaps []string
 	if Robots.Sitemaps != nil {
 		Sitemaps = Robots.Sitemaps
 	} else {
 		Sitemaps = []string{}
 	}
+
 	DisallowedBy := ""
 	if !Allowed {
 		DisallowedBy = "robots.txt disallow rule"
@@ -135,8 +144,6 @@ func (P *Parser) IsAllowed(Ctx context.Context, RawURL string) (*PermissionResul
 	}, nil
 }
 
-// GetRobots fetches and returns robots.txt for a given host
-// Uses caching with 24-hour expiration
 func (P *Parser) GetRobots(Ctx context.Context, Host string) (*robotstxt.RobotsData, error) {
 	if Host == "" {
 		return nil, fmt.Errorf("empty host provided")
@@ -150,30 +157,36 @@ func (P *Parser) GetRobots(Ctx context.Context, Host string) (*robotstxt.RobotsD
 	if Robots, Found := P.GetCachedRobots(NormalizedHost); Found {
 		return Robots, nil
 	}
+
+	// Use sharded lock to prevent concurrent fetches for the same host
 	HostMutex := P.GetPerHostMutex(NormalizedHost)
 	HostMutex.Lock()
 	defer HostMutex.Unlock()
 
-	// Check cache again in case another goroutine fetched it while we waited
+	// Double-check cache after lock
 	if Robots, Found := P.GetCachedRobots(NormalizedHost); Found {
 		return Robots, nil
 	}
+
 	FetchResult, Err := P.FetchRobotsFromServer(Ctx, Host)
 	if Err != nil {
 		return nil, fmt.Errorf("failed to fetch robots.txt for host %q: %w", Host, Err)
 	}
 
+	if FetchResult.Error != nil {
+		return nil, fmt.Errorf("robots.txt fetch failed: %w", FetchResult.Error)
+	}
+
 	if !FetchResult.Success || FetchResult.Robots == nil {
-		// Create permissive robots.txt for failed fetches
 		PermissiveRobots, _ := robotstxt.FromString("")
 		P.SetCachedRobots(NormalizedHost, PermissiveRobots)
 		return PermissiveRobots, nil
 	}
+
 	P.SetCachedRobots(NormalizedHost, FetchResult.Robots)
 	return FetchResult.Robots, nil
 }
 
-// FetchRobotsFromServer fetches robots.txt from the server for a given host
 func (P *Parser) FetchRobotsFromServer(Ctx context.Context, Host string) (*FetchResult, error) {
 	Start := time.Now()
 	RobotsURL := BuildRobotsURL(Host)
@@ -187,7 +200,6 @@ func (P *Parser) FetchRobotsFromServer(Ctx context.Context, Host string) (*Fetch
 		}, nil
 	}
 
-	// Use the centralized HTTP client
 	Resp, Err := P.HTTPClient.Get(Ctx, RobotsURL)
 	if Err != nil {
 		return &FetchResult{
@@ -218,7 +230,7 @@ func (P *Parser) FetchRobotsFromServer(Ctx context.Context, Host string) (*Fetch
 		Result.Error = fmt.Errorf("unexpected status code: %d", Resp.StatusCode)
 		return Result, nil
 	}
-	LimitedReader := io.LimitReader(Resp.Body, 500*1024) // 500KB limit
+	LimitedReader := io.LimitReader(Resp.Body, 500*1024)
 	Content, Err := io.ReadAll(LimitedReader)
 	if Err != nil {
 		Result.Error = fmt.Errorf("failed to read response body: %w", Err)
@@ -238,19 +250,16 @@ func (P *Parser) FetchRobotsFromServer(Ctx context.Context, Host string) (*Fetch
 	return Result, nil
 }
 
-// GetPerHostMutex returns a mutex for the given host to prevent concurrent fetching
+// GetPerHostMutex returns a mutex from the fixed shard set based on host hash.
+// This prevents infinite memory growth while ensuring thread safety.
 func (P *Parser) GetPerHostMutex(Host string) *sync.Mutex {
-	P.MutexLock.Lock()
-	defer P.MutexLock.Unlock()
-	if Mutex, Exists := P.FetchMutex[Host]; Exists {
-		return Mutex
-	}
-	Mutex := &sync.Mutex{}
-	P.FetchMutex[Host] = Mutex
-	return Mutex
+	h := fnv.New32a()
+	h.Write([]byte(Host))
+	// Map the hash to one of the 256 mutexes
+	idx := h.Sum32() % 256
+	return &P.lockShards[idx]
 }
 
-// IsExpired checks if a cache entry has expired
 func (P *Parser) IsExpired(Entry *CacheEntry) bool {
 	if Entry == nil {
 		return true
@@ -258,7 +267,6 @@ func (P *Parser) IsExpired(Entry *CacheEntry) bool {
 	return time.Now().After(Entry.ExpiresAt)
 }
 
-// GetCachedRobots returns cached robots.txt if it exists and is not expired
 func (P *Parser) GetCachedRobots(Host string) (*robotstxt.RobotsData, bool) {
 	P.CacheMutex.RLock()
 	defer P.CacheMutex.RUnlock()
@@ -272,7 +280,6 @@ func (P *Parser) GetCachedRobots(Host string) (*robotstxt.RobotsData, bool) {
 	return Entry.Robots, true
 }
 
-// SetCachedRobots stores robots.txt in the cache with expiration
 func (P *Parser) SetCachedRobots(Host string, Robots *robotstxt.RobotsData) {
 	P.CacheMutex.Lock()
 	defer P.CacheMutex.Unlock()
@@ -285,14 +292,12 @@ func (P *Parser) SetCachedRobots(Host string, Robots *robotstxt.RobotsData) {
 	P.Cache[Host] = Entry
 }
 
-// ClearCache removes all entries from the robots.txt cache
 func (P *Parser) ClearCache() {
 	P.CacheMutex.Lock()
 	defer P.CacheMutex.Unlock()
 	P.Cache = make(map[string]*CacheEntry)
 }
 
-// ClearExpired removes expired entries from the cache
 func (P *Parser) ClearExpired() int {
 	P.CacheMutex.Lock()
 	defer P.CacheMutex.Unlock()
@@ -306,7 +311,6 @@ func (P *Parser) ClearExpired() int {
 	return RemovedCount
 }
 
-// GetCacheStats returns statistics about the robots.txt cache
 func (P *Parser) GetCacheStats() CacheStats {
 	P.CacheMutex.RLock()
 	defer P.CacheMutex.RUnlock()
@@ -357,22 +361,20 @@ func (P *Parser) GetCacheStats() CacheStats {
 		ExpiredEntries: ExpiredEntries,
 		OldestEntry:    OldestEntry,
 		NewestEntry:    NewestEntry,
-		CacheHitRate:   0.0, // Not tracking hits/misses yet
+		CacheHitRate:   0.0,
 		AverageAge:     AverageAge,
 	}
 }
 
-// CacheStats holds statistics about the robots.txt cache
 type CacheStats struct {
-	TotalEntries   int           // Total number of cached entries
-	ExpiredEntries int           // Number of expired entries
-	OldestEntry    time.Time     // Timestamp of oldest entry
-	NewestEntry    time.Time     // Timestamp of newest entry
-	CacheHitRate   float64       // Cache hit rate (if tracking)
-	AverageAge     time.Duration // Average age of cache entries
+	TotalEntries   int
+	ExpiredEntries int
+	OldestEntry    time.Time
+	NewestEntry    time.Time
+	CacheHitRate   float64
+	AverageAge     time.Duration
 }
 
-// BuildRobotsURL constructs the robots.txt URL for a given host
 func BuildRobotsURL(Host string) string {
 	Host = strings.TrimSpace(Host)
 
@@ -380,15 +382,12 @@ func BuildRobotsURL(Host string) string {
 		return ""
 	}
 
-	// Ensure host has a scheme
 	if !strings.HasPrefix(Host, "http://") && !strings.HasPrefix(Host, "https://") {
 		Host = "http://" + Host
 	}
 
-	// Use frontier URL parsing utilities
 	U, Err := frontier.ParseURL(Host)
 	if Err != nil {
-		// Fallback for invalid URLs
 		if !strings.HasSuffix(Host, "/") {
 			Host += "/"
 		}
@@ -402,10 +401,9 @@ func BuildRobotsURL(Host string) string {
 	return U.String()
 }
 
-// ParseRobotsContent parses robots.txt content and returns RobotsData
 func ParseRobotsContent(Content []byte) (*robotstxt.RobotsData, error) {
 	if len(Content) == 0 {
-		R, _ := robotstxt.FromString("") // ignore error, empty string is valid
+		R, _ := robotstxt.FromString("")
 		return R, nil
 	}
 	R, Err := robotstxt.FromBytes(Content)
@@ -422,15 +420,11 @@ func ParseRobotsContent(Content []byte) (*robotstxt.RobotsData, error) {
 	return R, nil
 }
 
-// Close gracefully shuts down the parser and cleans up resources
 func (P *Parser) Close() error {
 	P.ClearCache()
 	if P.HTTPClient != nil {
 		P.HTTPClient.Close()
 	}
-	P.MutexLock.Lock()
-	P.FetchMutex = make(map[string]*sync.Mutex)
-	P.MutexLock.Unlock()
-
+	// No need to clean up mutexes as they are now a fixed array
 	return nil
 }

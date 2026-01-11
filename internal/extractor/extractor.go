@@ -15,6 +15,8 @@ import (
 	"go.uber.org/zap"
 )
 
+var whitespaceRegex = regexp.MustCompile(`\s+`)
+
 // ExtractedContent represents the result of content extraction
 type ExtractedContent struct {
 	Title         string            `json:"title"`
@@ -391,26 +393,18 @@ func (h *HTMLContentExtractor) RemoveBoilerplateContent(doc *goquery.Document) {
 	}
 }
 
-// CleanTextContent cleans and normalizes extracted text
 func (h *HTMLContentExtractor) CleanTextContent(text string) string {
 	if text == "" {
 		return ""
 	}
 
-	// Decode HTML entities
 	text = html.UnescapeString(text)
 
-	// Normalize whitespace if configured
 	if h.Config.NormalizeWhitespace {
-		// Replace multiple whitespace characters with single spaces
-		whitespaceRegex := regexp.MustCompile(`\s+`)
 		text = whitespaceRegex.ReplaceAllString(text, " ")
-
-		// Remove leading/trailing whitespace
 		text = strings.TrimSpace(text)
 	}
 
-	// Apply length constraints
 	if h.Config.MaxTextLength > 0 && len(text) > h.Config.MaxTextLength {
 		text = text[:h.Config.MaxTextLength]
 	}
@@ -418,25 +412,40 @@ func (h *HTMLContentExtractor) CleanTextContent(text string) string {
 	return text
 }
 
-// ScoreContentByLength scores content based on length (simple heuristic)
+// ScoreContentByLength scores content based on length and structure
 func (h *HTMLContentExtractor) ScoreContentByLength(content string) float64 {
-	length := len(strings.TrimSpace(content))
+	contentLen := len(strings.TrimSpace(content))
 
-	// Penalize very short or very long content
-	if length < h.Config.MinTextLength {
+	if contentLen < h.Config.MinTextLength {
 		return 0.0
 	}
 
-	if h.Config.MaxTextLength > 0 && length > h.Config.MaxTextLength {
-		return float64(length) * 0.5 // Penalize but don't eliminate
+	score := float64(contentLen)
+
+	// Penalize common non-content keywords (Copyright, Privacy, etc.)
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "all rights reserved") ||
+	   strings.Contains(lower, "privacy policy") ||
+	   strings.Contains(lower, "terms of service") {
+		score *= 0.4
 	}
 
-	// Optimal length range gets highest score
-	if length >= 500 && length <= 5000 {
-		return float64(length) * 2.0
+	// Punctuation density. Real content has sentences.
+	// Nav menus and lists often lack periods/commas.
+	punctCount := strings.Count(content, ".") + strings.Count(content, ",") + strings.Count(content, "!")
+	if contentLen > 0 {
+		density := float64(punctCount) / float64(contentLen)
+		if density < 0.005 { // Less than 1 punctuation per 200 chars -> likely not prose
+			score *= 0.5
+		}
 	}
 
-	return float64(length)
+	// Optional range boost (still useful, but probably not the only factor)
+	if contentLen >= 500 && contentLen <= 5000 {
+		score *= 1.5
+	}
+
+	return score
 }
 
 // GetDefaultExtractorConfig returns default configuration for content extraction

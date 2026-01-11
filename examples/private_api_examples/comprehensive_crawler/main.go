@@ -489,5 +489,3 @@ func (d *CrawlerDemo) printFinalStats() {
 	fmt.Println("✅ Crawler demonstration completed successfully!")
 	fmt.Println(strings.Repeat("=", 60))
 }
-
-// Notice me

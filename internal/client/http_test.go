@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -463,38 +465,39 @@ func TestIsRetryableError(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "timeout error",
-			err:      fmt.Errorf("request timeout occurred"),
+			name: "timeout error",
+			// Create a mock net.Error that returns Timeout() = true
+			err:      &net.DNSError{IsTimeout: true},
 			expected: true,
 		},
 		{
 			name:     "DNS error",
-			err:      fmt.Errorf("no such host example.com"),
+			err:      &net.DNSError{IsTemporary: true},
 			expected: true,
 		},
 		{
 			name:     "connection refused",
-			err:      fmt.Errorf("connection refused by server"),
+			err:      syscall.ECONNREFUSED, // Use actual syscall error
 			expected: true,
 		},
 		{
 			name:     "connection reset",
-			err:      fmt.Errorf("connection reset by peer"),
+			err:      syscall.ECONNRESET, // Use actual syscall error
 			expected: true,
 		},
 		{
 			name:     "EOF error",
-			err:      fmt.Errorf("unexpected EOF while reading"),
+			err:      io.EOF, // Use actual io.EOF
 			expected: true,
 		},
 		{
 			name:     "context canceled",
-			err:      fmt.Errorf("context canceled by user"),
+			err:      context.Canceled, // Use actual context.Canceled
 			expected: true,
 		},
 		{
 			name:     "deadline exceeded",
-			err:      fmt.Errorf("context deadline exceeded"),
+			err:      context.DeadlineExceeded, // Use actual context error
 			expected: true,
 		},
 		{

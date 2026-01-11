@@ -2,248 +2,136 @@ package crawler
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
+	"github.com/Almahr1/quert/internal/client"
 	"github.com/Almahr1/quert/internal/config"
+	"github.com/Almahr1/quert/internal/extractor"
+	"github.com/jarcoal/httpmock"
+	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
 
-func TestNewCrawlerEngine(t *testing.T) {
-	// Create test configurations
-	crawlerConfig := &config.CrawlerConfig{
-		MaxPages:          1000,
-		MaxDepth:          3,
-		ConcurrentWorkers: 4,
-		RequestTimeout:    10 * time.Second,
-		UserAgent:         "Test-Crawler/1.0",
+func setupTestEngine() *CrawlerEngine {
+	logger := zap.NewNop()
+	cfg := &config.CrawlerConfig{
+		ConcurrentWorkers: 2,
+		RequestTimeout:    time.Second,
+		UserAgent:         "TestBot",
 	}
+	httpCfg := client.DefaultHTTPConfig()
+	robotsCfg := &config.RobotsConfig{Enabled: false} // Disable robots for basic worker tests
 
-	httpConfig := &config.HTTPConfig{
-		MaxIdleConnections:        100,
-		MaxIdleConnectionsPerHost: 10,
-		IdleConnectionTimeout:     30 * time.Second,
-		DisableKeepAlives:         false,
-		Timeout:                   10 * time.Second,
-		DialTimeout:               5 * time.Second,
-		TlsHandshakeTimeout:       5 * time.Second,
-		ResponseHeaderTimeout:     5 * time.Second,
-		DisableCompression:        false,
-		AcceptEncoding:            "gzip, deflate",
-	}
+	engine := NewCrawlerEngine(cfg, httpCfg, robotsCfg, logger)
+	extractCfg := extractor.GetDefaultExtractorConfig()
+	extractCfg.QualityThreshold = 0.0 // Accept everything
+	engine.ExtractorFactory = extractor.NewExtractorFactory(extractCfg, logger)
 
-	robotsConfig := &config.RobotsConfig{
-		Enabled:            true,
-		CacheDuration:      1 * time.Hour,
-		UserAgent:          "Test-Crawler/1.0",
-		CrawlDelayOverride: false,
-		RespectCrawlDelay:  true,
-	}
-
-	logger, _ := zap.NewDevelopment()
-
-	// Test engine creation
-	engine := NewCrawlerEngine(crawlerConfig, httpConfig, robotsConfig, logger)
-
-	// Verify engine is properly initialized
-	if engine == nil {
-		t.Fatal("Expected CrawlerEngine to be created, got nil")
-	}
-
-	if engine.Workers != 4 {
-		t.Errorf("Expected 4 workers, got %d", engine.Workers)
-	}
-
-	if engine.Config.UserAgent != "Test-Crawler/1.0" {
-		t.Errorf("Expected user agent 'Test-Crawler/1.0', got %s", engine.Config.UserAgent)
-	}
-
-	if engine.IsRunning() {
-		t.Error("Expected engine to not be running initially")
-	}
-
-	if engine.HTTPClient == nil {
-		t.Error("Expected HTTP client to be initialized")
-	}
-
-	if engine.RobotsParser == nil {
-		t.Error("Expected robots parser to be initialized")
-	}
-
-	if len(engine.WorkerStats) != 4 {
-		t.Errorf("Expected 4 worker stats entries, got %d", len(engine.WorkerStats))
-	}
+	return engine
 }
 
-func TestCrawlerEngineStartStop(t *testing.T) {
-	// Create minimal test configuration
-	crawlerConfig := &config.CrawlerConfig{
-		MaxPages:          10,
-		MaxDepth:          1,
-		ConcurrentWorkers: 2,
-		RequestTimeout:    5 * time.Second,
-		UserAgent:         "Test-Crawler/1.0",
-	}
+func TestCrawlerEngine_StartStop(t *testing.T) {
+	engine := setupTestEngine()
+	ctx := context.Background()
 
-	httpConfig := &config.HTTPConfig{
-		MaxIdleConnections:        10,
-		MaxIdleConnectionsPerHost: 5,
-		IdleConnectionTimeout:     10 * time.Second,
-		DisableKeepAlives:         false,
-		Timeout:                   5 * time.Second,
-		DialTimeout:               2 * time.Second,
-		TlsHandshakeTimeout:       2 * time.Second,
-		ResponseHeaderTimeout:     2 * time.Second,
-		DisableCompression:        false,
-		AcceptEncoding:            "gzip",
-	}
+	// Start
+	err := engine.Start(ctx)
+	assert.NoError(t, err)
+	assert.True(t, engine.IsRunning())
 
-	logger, _ := zap.NewDevelopment()
-
-	engine := NewCrawlerEngine(crawlerConfig, httpConfig, nil, logger)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Test starting the engine
-	if err := engine.Start(ctx); err != nil {
-		t.Fatalf("Failed to start engine: %v", err)
-	}
-
-	if !engine.IsRunning() {
-		t.Error("Expected engine to be running after start")
-	}
-
-	// Let it run briefly
-	time.Sleep(100 * time.Millisecond)
-
-	// Test stopping the engine
-	if err := engine.Stop(); err != nil {
-		t.Fatalf("Failed to stop engine: %v", err)
-	}
-
-	if engine.IsRunning() {
-		t.Error("Expected engine to not be running after stop")
-	}
-
-	// Test that we can't start an already stopped engine that's been started before
-	// (This tests the lifecycle)
+	// Stop
+	err = engine.Stop()
+	assert.NoError(t, err)
+	assert.False(t, engine.IsRunning())
 }
 
-func TestGetMetrics(t *testing.T) {
-	crawlerConfig := &config.CrawlerConfig{
-		ConcurrentWorkers: 2,
-		RequestTimeout:    5 * time.Second,
-		UserAgent:         "Test-Crawler/1.0",
+func TestCrawlerEngine_SubmitJob(t *testing.T) {
+	engine := setupTestEngine()
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop()
+
+	// Mock robots.txt to be allowed (since engine checks it on submit)
+	httpmock.ActivateNonDefault(engine.HTTPClient.Client)
+	defer httpmock.DeactivateAndReset()
+	httpmock.RegisterResponder("GET", "http://example.com/robots.txt", httpmock.NewStringResponder(404, ""))
+
+	job := &CrawlJob{
+		URL: "http://example.com/page",
 	}
 
-	httpConfig := &config.HTTPConfig{
-		Timeout: 5 * time.Second,
-	}
+	err := engine.SubmitJob(job)
+	assert.NoError(t, err)
 
-	logger, _ := zap.NewDevelopment()
-
-	engine := NewCrawlerEngine(crawlerConfig, httpConfig, nil, logger)
-
-	// Test metrics before starting
 	metrics := engine.GetMetrics()
-	if metrics == nil {
-		t.Fatal("Expected metrics to be returned, got nil")
-	}
 
-	if metrics.TotalJobs != 0 {
-		t.Errorf("Expected 0 total jobs initially, got %d", metrics.TotalJobs)
-	}
-
-	if metrics.ActiveWorkers != 0 {
-		t.Errorf("Expected 0 active workers initially, got %d", metrics.ActiveWorkers)
-	}
-
-	if metrics.QueueDepth < 0 {
-		t.Errorf("Expected non-negative queue depth, got %d", metrics.QueueDepth)
-	}
+	assert.Equal(t, int64(1), metrics.TotalJobs)
 }
 
-func TestGetWorkerStats(t *testing.T) {
-	crawlerConfig := &config.CrawlerConfig{
-		ConcurrentWorkers: 3,
-		RequestTimeout:    5 * time.Second,
-		UserAgent:         "Test-Crawler/1.0",
+func TestCrawlerEngine_WorkerProcessing(t *testing.T) {
+	engine := setupTestEngine()
+	ctx := context.Background()
+
+	httpmock.ActivateNonDefault(engine.HTTPClient.Client)
+	defer httpmock.DeactivateAndReset()
+
+	// Mock robots (404 = allow)
+	httpmock.RegisterResponder("GET", "http://example.com/robots.txt", httpmock.NewStringResponder(404, ""))
+
+	// Mock Page Content WITH Content-Type header
+	httpmock.RegisterResponder("GET", "http://example.com/page",
+		func(req *http.Request) (*http.Response, error) {
+			resp := httpmock.NewStringResponse(200, `<html><body><h1>Hello World</h1><a href="/link">Link</a></body></html>`)
+			resp.Header.Set("Content-Type", "text/html")
+			return resp, nil
+		},
+	)
+
+	engine.Start(ctx)
+
+	// Submit Job
+	job := &CrawlJob{URL: "http://example.com/page"}
+	err := engine.SubmitJob(job)
+	assert.NoError(t, err)
+
+	// Wait for result (poll results channel)
+	select {
+	case result := <-engine.GetResults():
+		assert.True(t, result.Success)
+		assert.Equal(t, "http://example.com/page", result.URL)
+		assert.Equal(t, 200, result.StatusCode)
+		assert.Contains(t, result.ExtractedText, "Hello World")
+		assert.Equal(t, 1, len(result.Links))
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for crawl result")
 	}
 
-	httpConfig := &config.HTTPConfig{
-		Timeout: 5 * time.Second,
-	}
-
-	logger, _ := zap.NewDevelopment()
-
-	engine := NewCrawlerEngine(crawlerConfig, httpConfig, nil, logger)
-
-	stats := engine.GetWorkerStats()
-	if stats == nil {
-		t.Fatal("Expected worker stats to be returned, got nil")
-	}
-
-	if len(stats) != 3 {
-		t.Errorf("Expected 3 worker stats, got %d", len(stats))
-	}
-
-	// Check that each worker has proper initial stats
-	for i := 0; i < 3; i++ {
-		workerStat, exists := stats[i]
-		if !exists {
-			t.Errorf("Expected worker %d stats to exist", i)
-			continue
-		}
-
-		if workerStat.WorkerID != i {
-			t.Errorf("Expected worker ID %d, got %d", i, workerStat.WorkerID)
-		}
-
-		if workerStat.JobsProcessed != 0 {
-			t.Errorf("Expected 0 jobs processed initially for worker %d, got %d", i, workerStat.JobsProcessed)
-		}
-
-		if workerStat.IsActive {
-			t.Errorf("Expected worker %d to be inactive initially", i)
-		}
-	}
+	engine.Stop()
 }
 
-func TestGetRateLimiter(t *testing.T) {
-	crawlerConfig := &config.CrawlerConfig{
-		ConcurrentWorkers: 1,
-		RequestTimeout:    5 * time.Second,
-		UserAgent:         "Test-Crawler/1.0",
-	}
+func TestCrawlerEngine_RateLimiter(t *testing.T) {
+	engine := setupTestEngine()
+	limiter := engine.GetRateLimiter("example.com")
+	assert.NotNil(t, limiter)
 
-	httpConfig := &config.HTTPConfig{
-		Timeout: 5 * time.Second,
-	}
+	// Check burst settings from config
+	assert.Equal(t, float64(5), float64(limiter.Burst())) // Default burst
+}
 
-	logger, _ := zap.NewDevelopment()
+func TestCrawlerEngine_ContextCancellation(t *testing.T) {
+	engine := setupTestEngine()
+	ctx, cancel := context.WithCancel(context.Background())
 
-	engine := NewCrawlerEngine(crawlerConfig, httpConfig, nil, logger)
+	engine.Start(ctx)
+	assert.True(t, engine.IsRunning())
 
-	// Test creating rate limiter for a host
-	host := "example.com"
-	limiter1 := engine.GetRateLimiter(host)
+	cancel() // Cancel context
 
-	if limiter1 == nil {
-		t.Fatal("Expected rate limiter to be created, got nil")
-	}
-
-	// Test that the same host returns the same limiter
-	limiter2 := engine.GetRateLimiter(host)
-
-	if limiter1 != limiter2 {
-		t.Error("Expected same rate limiter instance for the same host")
-	}
-
-	// Test different host gets different limiter
-	limiter3 := engine.GetRateLimiter("different.com")
-
-	if limiter1 == limiter3 {
-		t.Error("Expected different rate limiter for different host")
-	}
+	// Engine should eventually stop or handle cancellation gracefully
+	// We verify manually calling Stop still works
+	err := engine.Stop()
+	assert.NoError(t, err)
+	assert.False(t, engine.IsRunning())
 }

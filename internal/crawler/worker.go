@@ -76,7 +76,8 @@ type CrawlerEngine struct {
 	// Worker pool management
 	Workers     int
 	Jobs        chan *CrawlJob
-	Results     chan *CrawlResult
+	Results     chan *CrawlResult // Workers -> Processor
+	UserResults chan *CrawlResult // Processor -> User
 	WorkerStats map[int]*WorkerStats
 	StatsMutex  sync.RWMutex
 
@@ -94,6 +95,7 @@ type CrawlerEngine struct {
 	Ctx          context.Context
 	Cancel       context.CancelFunc
 	Wg           sync.WaitGroup
+	WorkerWg     sync.WaitGroup
 	Running      bool
 	RunningMutex sync.RWMutex
 
@@ -197,6 +199,7 @@ func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, rob
 
 	jobsChannel := make(chan *CrawlJob, jobsBufferSize)
 	resultsChannel := make(chan *CrawlResult, resultsBufferSize)
+	userResultsChannel := make(chan *CrawlResult, resultsBufferSize)
 
 	httpClient := client.NewHTTPClient(httpCfg, logger)
 
@@ -299,6 +302,7 @@ func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, rob
 		Workers:     crawlerConfig.ConcurrentWorkers,
 		Jobs:        jobsChannel,
 		Results:     resultsChannel,
+		UserResults: userResultsChannel,
 		WorkerStats: workerStats,
 		StatsMutex:  sync.RWMutex{},
 
@@ -355,7 +359,7 @@ func (CrawlerEngine *CrawlerEngine) Start(Context context.Context) error {
 
 	// Spawn configured number of worker goroutines
 	for WorkerID := 0; WorkerID < CrawlerEngine.Workers; WorkerID++ {
-		CrawlerEngine.Wg.Add(1)
+		CrawlerEngine.WorkerWg.Add(1)
 		go CrawlerEngine.Worker(CrawlerEngine.Ctx, WorkerID)
 	}
 
@@ -383,9 +387,6 @@ func (CrawlerEngine *CrawlerEngine) Start(Context context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the crawler engine
-// worker.go
-
 func (CrawlerEngine *CrawlerEngine) Stop() error {
 	if !CrawlerEngine.IsRunning() {
 		return fmt.Errorf("crawler engine is not running")
@@ -404,6 +405,21 @@ func (CrawlerEngine *CrawlerEngine) Stop() error {
 	remainingJobs := len(CrawlerEngine.Jobs)
 	close(CrawlerEngine.Jobs)
 
+	workerDone := make(chan struct{})
+	go func() {
+		CrawlerEngine.WorkerWg.Wait()
+		close(workerDone)
+	}()
+
+	select {
+	case <-workerDone:
+		CrawlerEngine.Logger.Info("all workers finished")
+	case <-time.After(15 * time.Second):
+		CrawlerEngine.Logger.Warn("timeout waiting for workers")
+	}
+
+	close(CrawlerEngine.Results)
+
 	waitDone := make(chan struct{})
 	go func() {
 		CrawlerEngine.Wg.Wait()
@@ -412,12 +428,10 @@ func (CrawlerEngine *CrawlerEngine) Stop() error {
 
 	select {
 	case <-waitDone:
-		CrawlerEngine.Logger.Info("all workers finished gracefully")
-	case <-time.After(30 * time.Second):
-		CrawlerEngine.Logger.Warn("timeout waiting for workers to finish, forcing shutdown")
+		CrawlerEngine.Logger.Info("result processor and background tasks finished")
+	case <-time.After(15 * time.Second):
+		CrawlerEngine.Logger.Warn("timeout waiting for background tasks")
 	}
-
-	close(CrawlerEngine.Results)
 
 	CrawlerEngine.LimiterMutex.Lock()
 	for Host := range CrawlerEngine.HostLimiters {
@@ -428,7 +442,7 @@ func (CrawlerEngine *CrawlerEngine) Stop() error {
 	Metrics := CrawlerEngine.GetMetrics()
 	if Metrics != nil {
 		CrawlerEngine.Logger.Info("crawler engine stopped",
-			zap.Int("jobs_left_in_queue", remainingJobs), // Clarified the log key
+			zap.Int("jobs_left_in_queue", remainingJobs),
 			zap.Int64("total_jobs", Metrics.TotalJobs),
 			zap.Int64("successful_jobs", Metrics.SuccessfulJobs),
 			zap.Int64("timed_out_jobs", Metrics.TimedOutJobs),
@@ -439,9 +453,7 @@ func (CrawlerEngine *CrawlerEngine) Stop() error {
 	return nil
 }
 
-// SubmitJob adds a new crawl job to the queue
 func (CrawlerEngine *CrawlerEngine) SubmitJob(Job *CrawlJob) error {
-	// Validate job parameters (URL, context not nil)
 	if Job == nil {
 		return fmt.Errorf("job cannot be nil")
 	}
@@ -452,20 +464,16 @@ func (CrawlerEngine *CrawlerEngine) SubmitJob(Job *CrawlJob) error {
 		Job.Context = context.Background()
 	}
 
-	// Check if engine is running (return error if not)
 	if !CrawlerEngine.IsRunning() {
 		return fmt.Errorf("crawler engine is not running")
 	}
 
-	// Set job submission timestamp
 	Job.SubmittedAt = time.Now()
 
-	// Generate unique request ID if not provided
 	if Job.RequestID == "" {
 		Job.RequestID = fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63())
 	}
 
-	// Check robots.txt permissions for the URL
 	HostFromURL, ExtractErr := frontier.ExtractHostFromURL(Job.URL)
 	if ExtractErr != nil {
 		return fmt.Errorf("failed to extract host from URL: %w", ExtractErr)
@@ -480,7 +488,6 @@ func (CrawlerEngine *CrawlerEngine) SubmitJob(Job *CrawlJob) error {
 		return fmt.Errorf("URL disallowed by robots.txt: %s", Job.URL)
 	}
 
-	// Apply rate limiting for the host
 	HostLimiter := CrawlerEngine.GetRateLimiter(HostFromURL)
 	if GlobalErr := CrawlerEngine.GlobalLimiter.Wait(Job.Context); GlobalErr != nil {
 		return fmt.Errorf("global rate limit wait failed: %w", GlobalErr)
@@ -489,40 +496,29 @@ func (CrawlerEngine *CrawlerEngine) SubmitJob(Job *CrawlJob) error {
 		return fmt.Errorf("host rate limit wait failed: %w", HostErr)
 	}
 
-	// Attempt to send job to jobs channel (non-blocking)
 	select {
 	case CrawlerEngine.Jobs <- Job:
-		// Successfully queued
 	case <-Job.Context.Done():
 		return Job.Context.Err()
-	default:
-		return fmt.Errorf("job queue is full, cannot accept new jobs")
 	}
 
-	// Increment total jobs counter (thread-safe)
 	atomic.AddInt64(&CrawlerEngine.TotalJobs, 1)
 
-	// Log job submission with URL and priority
 	CrawlerEngine.Logger.Debug("job submitted to queue",
 		zap.String("url", Job.URL),
 		zap.String("request_id", Job.RequestID),
 		zap.Int("priority", Job.Priority),
 		zap.Int("depth", Job.Depth))
 
-	// Return nil on success, error on failure or queue full
 	return nil
 }
 
 // GetResults returns a channel for receiving crawl results
 func (CrawlerEngine *CrawlerEngine) GetResults() <-chan *CrawlResult {
-	// Check if engine is initialized
 	if CrawlerEngine == nil {
 		return nil
 	}
-
-	// Return read-only channel to results
-	// Note: This is a simple getter but important for proper channel access
-	return CrawlerEngine.Results
+	return CrawlerEngine.UserResults
 }
 
 // GetMetrics returns current crawler performance metrics
@@ -601,7 +597,6 @@ func (CrawlerEngine *CrawlerEngine) GetMetrics() *CrawlerMetrics {
 
 // GetWorkerStats returns statistics for all workers
 func (CrawlerEngine *CrawlerEngine) GetWorkerStats() map[int]*WorkerStats {
-	// Acquire read lock for thread-safe access
 	CrawlerEngine.StatsMutex.RLock()
 	defer CrawlerEngine.StatsMutex.RUnlock()
 
@@ -632,13 +627,11 @@ func (CrawlerEngine *CrawlerEngine) GetWorkerStats() map[int]*WorkerStats {
 		StatsCopy[WorkerID].IsActive = OriginalStats.CurrentJob != nil
 	}
 
-	// Release lock and return stats copy (handled by defer)
 	return StatsCopy
 }
 
 // SetMetricsCallback sets a callback function for metrics reporting
 func (CrawlerEngine *CrawlerEngine) SetMetricsCallback(Callback func(*CrawlerMetrics)) {
-	// Store callback function for later use
 	CrawlerEngine.MetricsCallback = Callback
 
 	// If engine is running, restart metrics goroutine with new callback
@@ -651,7 +644,7 @@ func (CrawlerEngine *CrawlerEngine) SetMetricsCallback(Callback func(*CrawlerMet
 
 // Worker is the main worker goroutine function
 func (CrawlerEngine *CrawlerEngine) Worker(Context context.Context, WorkerID int) {
-	defer CrawlerEngine.Wg.Done()
+	defer CrawlerEngine.WorkerWg.Done()
 
 	CrawlerEngine.StatsMutex.Lock()
 	if CrawlerEngine.WorkerStats[WorkerID] != nil {
@@ -673,6 +666,11 @@ func (CrawlerEngine *CrawlerEngine) Worker(Context context.Context, WorkerID int
 		CrawlerEngine.Logger.Info("worker stopped",
 			zap.Int("worker_id", WorkerID))
 	}()
+
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C // drain
+	}
 
 	for {
 		select {
@@ -707,11 +705,18 @@ func (CrawlerEngine *CrawlerEngine) Worker(Context context.Context, WorkerID int
 
 			CrawlerEngine.UpdateWorkerStats(WorkerID, Job, Result)
 
+			timer.Reset(5 * time.Second)
 			select {
 			case CrawlerEngine.Results <- Result:
+				if !timer.Stop() {
+					<-timer.C
+				}
 			case <-Context.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return
-			case <-time.After(5 * time.Second):
+			case <-timer.C:
 				CrawlerEngine.Logger.Warn("timeout sending result to results channel",
 					zap.Int("worker_id", WorkerID),
 					zap.String("url", Job.URL))
@@ -851,24 +856,29 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 
 // ResultProcessor handles crawl results and manages output
 func (CrawlerEngine *CrawlerEngine) ResultProcessor(Context context.Context) {
-	// Decrement wait group when function exits
 	defer CrawlerEngine.Wg.Done()
+
+	defer close(CrawlerEngine.UserResults)
 
 	CrawlerEngine.Logger.Info("result processor started")
 
-	// Log processor shutdown when loop exits
 	defer func() {
 		CrawlerEngine.Logger.Info("result processor stopped")
 	}()
+
+	drainTimer := time.NewTimer(0)
+	if !drainTimer.Stop() {
+		<-drainTimer.C
+	}
 
 	// Start result processing loop with context cancellation
 	for {
 		select {
 		case <-Context.Done():
-			// Handle context cancellation and drain remaining results
 			CrawlerEngine.Logger.Info("result processor received shutdown signal, draining remaining results")
-			// Drain any remaining results with timeout
-			DrainTimeout := time.After(10 * time.Second)
+
+			drainTimer.Reset(10 * time.Second)
+
 			for {
 				select {
 				case Result, ChannelOpen := <-CrawlerEngine.Results:
@@ -876,8 +886,8 @@ func (CrawlerEngine *CrawlerEngine) ResultProcessor(Context context.Context) {
 						CrawlerEngine.Logger.Info("results channel closed, result processor exiting")
 						return
 					}
-					CrawlerEngine.ProcessResult(Result)
-				case <-DrainTimeout:
+					CrawlerEngine.handleResultRouting(Result)
+				case <-drainTimer.C:
 					CrawlerEngine.Logger.Warn("timeout draining results, forcing shutdown")
 					return
 				}
@@ -890,8 +900,26 @@ func (CrawlerEngine *CrawlerEngine) ResultProcessor(Context context.Context) {
 				return
 			}
 
-			CrawlerEngine.ProcessResult(Result)
+			CrawlerEngine.handleResultRouting(Result)
 		}
+	}
+}
+
+// handleResultRouting processes the result internally and forwards it to the user
+func (CrawlerEngine *CrawlerEngine) handleResultRouting(Result *CrawlResult) {
+	// 1. Internal Processing (Stats, logging, retry logic, etc.)
+	CrawlerEngine.ProcessResult(Result)
+
+	// 2. Forward to User
+	// Non-blocking send to prevent stalling the engine if the user (or test) isn't reading fast enough
+	select {
+	case CrawlerEngine.UserResults <- Result:
+		// Sent successfully
+	default:
+		// Buffer full, drop result to keep engine running
+		// In a production system, you might want to increase buffer size or warn
+		CrawlerEngine.Logger.Warn("user results channel full, dropping result",
+			zap.String("url", Result.URL))
 	}
 }
 
