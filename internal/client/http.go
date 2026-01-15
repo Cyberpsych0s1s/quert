@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Almahr1/quert/internal/config"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 type HTTPClient struct {
@@ -68,11 +70,21 @@ type TimeoutMiddleware struct {
 }
 
 type RateLimitMiddleware struct {
-	// TODO: Add rate limiter fields
+	GlobalLimiter *rate.Limiter
+	HostLimiters  map[string]*rate.Limiter
+	Mu            sync.RWMutex
+	RPS           float64
+	Burst         int
+	PerHost       bool
+}
+
+type HTTPMetricsCollector interface {
+	RecordRequest(method string, url string, statusCode int, duration time.Duration, size int64)
+	RecordError(method string, url string, err error)
 }
 
 type MetricsMiddleware struct {
-	// TODO: Add metrics collection fields
+	Collector HTTPMetricsCollector
 }
 
 type Response struct {
@@ -325,10 +337,44 @@ func (m *TimeoutMiddleware) RoundTrip(req *http.Request, next http.RoundTripper)
 }
 
 func (m *RateLimitMiddleware) RoundTrip(req *http.Request, next http.RoundTripper) (*http.Response, error) {
-	// TODO: For now, just pass through. A full implementation would need
-	// a rate limiter like golang.org/x/time/rate or similar
-	// This would typically include per-host rate limiting for web crawling
+	ctx := req.Context()
+
+	if m.GlobalLimiter != nil {
+		if err := m.GlobalLimiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("global rate limit exceeded: %w", err)
+		}
+	}
+
+	if m.PerHost {
+		host := req.URL.Hostname()
+		limiter := m.getLimit(host)
+		if err := limiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("host rate limit exceeded for %s: %w", host, err)
+		}
+	}
+
 	return next.RoundTrip(req)
+}
+
+func (m *RateLimitMiddleware) getLimit(host string) *rate.Limiter {
+	m.Mu.RLock()
+	limiter, exists := m.HostLimiters[host]
+	m.Mu.RUnlock()
+
+	if exists {
+		return limiter
+	}
+
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
+
+	if limiter, exists := m.HostLimiters[host]; exists {
+		return limiter
+	}
+
+	limiter = rate.NewLimiter(rate.Limit(m.RPS), m.Burst)
+	m.HostLimiters[host] = limiter
+	return limiter
 }
 
 func (m *MetricsMiddleware) RoundTrip(req *http.Request, next http.RoundTripper) (*http.Response, error) {
@@ -337,14 +383,17 @@ func (m *MetricsMiddleware) RoundTrip(req *http.Request, next http.RoundTripper)
 	resp, err := next.RoundTrip(req)
 	duration := time.Since(start)
 
-	// TODO: Record metrics here. In a full implementation, you'd update
-	// Prometheus counters, histograms, etc. For example:
-	// - HTTP request total counter by method and status
-	// - Request duration histogram using duration variable
-	// - Response size histogram
-	// - Error rate by type
-
-	_ = duration // Suppress unused variable warning until metrics are implemented
+	if m.Collector != nil {
+		if err != nil {
+			m.Collector.RecordError(req.Method, req.URL.String(), err)
+		} else {
+			contentLength := resp.ContentLength
+			if contentLength == -1 {
+				contentLength = 0
+			}
+			m.Collector.RecordRequest(req.Method, req.URL.String(), resp.StatusCode, duration, contentLength)
+		}
+	}
 
 	return resp, err
 }
@@ -367,15 +416,24 @@ func NewTimeoutMiddleware(timeout time.Duration) *TimeoutMiddleware {
 	}
 }
 
-func NewRateLimitMiddleware() *RateLimitMiddleware {
-	return &RateLimitMiddleware{
-		// TODO: Initialize rate limiter fields
+func NewRateLimitMiddleware(rps float64, burst int, perHost bool) *RateLimitMiddleware {
+	m := &RateLimitMiddleware{
+		HostLimiters: make(map[string]*rate.Limiter),
+		RPS:          rps,
+		Burst:        burst,
+		PerHost:      perHost,
 	}
+
+	if !perHost && rps > 0 {
+		m.GlobalLimiter = rate.NewLimiter(rate.Limit(rps), burst)
+	}
+
+	return m
 }
 
-func NewMetricsMiddleware() *MetricsMiddleware {
+func NewMetricsMiddleware(collector HTTPMetricsCollector) *MetricsMiddleware {
 	return &MetricsMiddleware{
-		// TODO: Initialize metrics collector fields
+		Collector: collector,
 	}
 }
 
