@@ -281,7 +281,8 @@ func BindEnvVariables(v *viper.Viper) {
 	}
 
 	for key, env := range envMappings {
-		v.BindEnv(key, env)
+		// BindEnv only errors when called with no args; key+env are always set.
+		_ = v.BindEnv(key, env)
 	}
 }
 
