@@ -1,0 +1,9 @@
+# golangci-lint config. Keep the default linter set strict on real code;
+# only relax intentional patterns in tests.
+issues:
+  exclude-rules:
+    # Unchecked error returns in test setup/teardown (Start/Stop/Write) are
+    # intentional — don't flag errcheck in test files.
+    - path: _test\.go
+      linters:
+        - errcheck
