@@ -41,7 +41,7 @@ func TestCrawlToJSONL(t *testing.T) {
 	require.NoError(t, err)
 	cfg.Crawler.MaxPages = 5
 	cfg.Crawler.MaxDepth = 2
-	cfg.Content.QualityThreshold = 0.001        // accept ~everything for the test
+	cfg.Content.QualityThreshold = 0.001               // accept ~everything for the test
 	cfg.Crawler.AllowedDomains = []string{"127.0.0.1"} // override the default loopback block
 
 	var buf bytes.Buffer

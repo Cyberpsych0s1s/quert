@@ -452,8 +452,8 @@ func (h *HTMLContentExtractor) ScoreContentByLength(content string) float64 {
 	// Penalize common non-content keywords (Copyright, Privacy, etc.)
 	lower := strings.ToLower(content)
 	if strings.Contains(lower, "all rights reserved") ||
-	   strings.Contains(lower, "privacy policy") ||
-	   strings.Contains(lower, "terms of service") {
+		strings.Contains(lower, "privacy policy") ||
+		strings.Contains(lower, "terms of service") {
 		score *= 0.4
 	}
 

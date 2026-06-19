@@ -541,9 +541,9 @@ func TestCoordinator_LanguageFilter(t *testing.T) {
 
 func TestExtractorConfigFromContent(t *testing.T) {
 	cc := &config.ContentConfig{
-		MinTextLength:    50,
-		MaxTextLength:    1234,
-		QualityThreshold: 0.55,
+		MinTextLength:     50,
+		MaxTextLength:     1234,
+		QualityThreshold:  0.55,
 		RemoveBoilerplate: false,
 	}
 	ec := ExtractorConfigFromContent(cc)

@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cyberpsych0s1s/quert/internal/frontier"
 	"github.com/PuerkitoBio/goquery"
+	"github.com/cyberpsych0s1s/quert/internal/frontier"
 	"go.uber.org/zap"
 )
 

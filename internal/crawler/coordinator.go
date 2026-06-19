@@ -23,10 +23,10 @@ type ResultSink func(*CrawlResult)
 
 // CrawlStats summarizes a completed crawl.
 type CrawlStats struct {
-	Dispatched int // jobs submitted to the engine
-	Received   int // results received back
-	Succeeded  int // results with a successful fetch
-	Failed     int // results with an error (final, after retries exhausted)
+	Dispatched    int // jobs submitted to the engine
+	Received      int // results received back
+	Succeeded     int // results with a successful fetch
+	Failed        int // results with an error (final, after retries exhausted)
 	Duplicate     int // successful pages dropped as exact content duplicates
 	NearDuplicate int // successful pages dropped as near-duplicates (simhash)
 	Retried       int // retryable failures re-dispatched
@@ -78,8 +78,8 @@ func (h frontierHeap) Less(i, j int) bool {
 	}
 	return a.seq < b.seq
 }
-func (h frontierHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *frontierHeap) Push(x any)        { *h = append(*h, x.(frontierItem)) }
+func (h frontierHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *frontierHeap) Push(x any)   { *h = append(*h, x.(frontierItem)) }
 func (h *frontierHeap) Pop() any {
 	old := *h
 	n := len(old)
