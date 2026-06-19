@@ -15,8 +15,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/Almahr1/quert/internal/storage"
-	"github.com/Almahr1/quert/internal/storage/memory"
+	"github.com/cyberpsych0s1s/quert/internal/storage"
+	"github.com/cyberpsych0s1s/quert/internal/storage/memory"
 )
 
 type URLInfo struct {
@@ -433,23 +433,31 @@ func (v *URLValidator) ValidateDomain(domain string) bool {
 		host = hostParts[0]
 	}
 
-	for _, blocked := range v.BlockedDomains {
-		if strings.EqualFold(host, blocked) || strings.HasSuffix(strings.ToLower(host), "."+strings.ToLower(blocked)) {
-			return false
-		}
+	matches := func(h, pat string) bool {
+		return strings.EqualFold(h, pat) || strings.HasSuffix(strings.ToLower(h), "."+strings.ToLower(pat))
 	}
 
-	if len(v.AllowedDomains) == 0 {
-		return true
-	}
-
+	// An explicit allow-list entry wins over the block-list: naming a domain in
+	// AllowedDomains is a deliberate opt-in (e.g. an internal host) that
+	// overrides the default loopback/SSRF block.
 	for _, allowed := range v.AllowedDomains {
-		if strings.EqualFold(host, allowed) || strings.HasSuffix(strings.ToLower(host), "."+strings.ToLower(allowed)) {
+		if matches(host, allowed) {
 			return true
 		}
 	}
 
-	return false
+	for _, blocked := range v.BlockedDomains {
+		if matches(host, blocked) {
+			return false
+		}
+	}
+
+	// A non-empty allow-list restricts the crawl to those domains.
+	if len(v.AllowedDomains) > 0 {
+		return false
+	}
+
+	return true
 }
 
 func (v *URLValidator) ValidateContentType(contentType string) bool {

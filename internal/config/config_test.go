@@ -23,7 +23,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	assert.Equal(t, 5, config.Crawler.MaxDepth)
 	assert.Equal(t, 10, config.Crawler.ConcurrentWorkers)
 	assert.Equal(t, 30*time.Second, config.Crawler.RequestTimeout)
-	assert.Equal(t, "LLMCrawler/1.0 (+https://github.com/Almahr1/quert)", config.Crawler.UserAgent)
+	assert.Equal(t, "LLMCrawler/1.0 (+https://github.com/cyberpsych0s1s/quert)", config.Crawler.UserAgent)
 
 	assert.Equal(t, 2.0, config.RateLimit.RequestsPerSecond)
 	assert.Equal(t, 10, config.RateLimit.Burst)

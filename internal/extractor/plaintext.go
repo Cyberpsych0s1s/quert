@@ -78,8 +78,8 @@ func (p *PlainTextExtractor) ExtractTitleFromText(text string) string {
 	}
 
 	// If no good title found, use first 50 characters
-	if len(text) > 50 {
-		return strings.TrimSpace(text[:50]) + "..."
+	if runeLen(text) > 50 {
+		return strings.TrimSpace(truncateRunes(text, 50)) + "..."
 	}
 
 	return strings.TrimSpace(text)
@@ -104,8 +104,8 @@ func (p *PlainTextExtractor) CleanTextContent(text string) string {
 	}
 
 	// Apply length constraints
-	if p.Config.MaxTextLength > 0 && len(cleaned) > p.Config.MaxTextLength {
-		cleaned = cleaned[:p.Config.MaxTextLength]
+	if p.Config.MaxTextLength > 0 {
+		cleaned = truncateRunes(cleaned, p.Config.MaxTextLength)
 	}
 
 	return cleaned
@@ -139,9 +139,9 @@ func (p *PlainTextExtractor) CreateDescriptionFromText(text string) string {
 	}
 
 	// Use first 200 characters as description
-	if len(text) > 200 {
+	if runeLen(text) > 200 {
 		// Find the last complete sentence within 200 characters
-		excerpt := text[:200]
+		excerpt := truncateRunes(text, 200)
 		lastSentence := strings.LastIndexAny(excerpt, ".!?")
 		if lastSentence > 50 { // Ensure we have at least 50 chars
 			return strings.TrimSpace(excerpt[:lastSentence+1])

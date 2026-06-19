@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Almahr1/quert/internal/config"
+	"github.com/cyberpsych0s1s/quert/internal/config"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
@@ -185,11 +185,13 @@ func (c *HTTPClient) Do(ctx context.Context, req *http.Request) (*Response, erro
 	start := time.Now()
 	var lastErr error
 	var resp *http.Response
+	attempts := 0
 
 	transport := ChainMiddleware(c.Middleware, c.Client.Transport)
 
 	for attempt := 0; attempt <= c.RetryConfig.MaxRetries; attempt++ {
 		reqClone := req.Clone(ctx)
+		attempts = attempt + 1
 
 		if attempt > 0 {
 			delay := c.RetryConfig.BackoffStrategy.NextDelay(attempt)
@@ -239,7 +241,7 @@ func (c *HTTPClient) Do(ctx context.Context, req *http.Request) (*Response, erro
 		StatusCode:    resp.StatusCode,
 		ContentLength: resp.ContentLength,
 		Duration:      duration,
-		Attempts:      1, // Will be updated in retry logic if needed
+		Attempts:      attempts,
 	}
 
 	return response, nil
@@ -509,6 +511,9 @@ func IsRetryableStatus(statusCode int, retryableStatus []int) bool {
 func BuildHTTPClient(cfg *config.HTTPConfig) *http.Client {
 	dialer := &net.Dialer{
 		Timeout: cfg.DialTimeout,
+		Control: func(network string, address string, c syscall.RawConn) error {
+			return nil
+		},
 	}
 
 	transport := &http.Transport{

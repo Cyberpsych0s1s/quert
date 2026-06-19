@@ -2,9 +2,10 @@ package extractor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/Almahr1/quert/internal/frontier"
+	"github.com/cyberpsych0s1s/quert/internal/frontier"
 	"github.com/PuerkitoBio/goquery"
 	"go.uber.org/zap"
 )
@@ -347,27 +348,47 @@ func (h *HTMLContentExtractor) FilterImagesByType(images []ExtractedImage, image
 	return filtered
 }
 
-// IsLargeImage determines if an image is considered large based on dimensions
+// largeImageThresholdPx is the pixel dimension at or above which an image is
+// considered "large" on either axis.
+const largeImageThresholdPx = 100
+
+// IsLargeImage determines if an image is considered large based on dimensions.
+// A dimension counts as large when its numeric pixel value is at least
+// largeImageThresholdPx. If neither dimension carries usable size info, the
+// image is treated as large (conservative default).
 func (h *HTMLContentExtractor) IsLargeImage(image ExtractedImage) bool {
-	// Simple heuristic based on dimension strings
-	if image.Width != "" {
-		if strings.HasSuffix(image.Width, "px") {
-			widthStr := strings.TrimSuffix(image.Width, "px")
-			if len(widthStr) >= 3 { // 3+ digit width (100px+)
-				return true
-			}
-		}
+	w, wOK := parsePixelDimension(image.Width)
+	hpx, hOK := parsePixelDimension(image.Height)
+
+	if wOK && w >= largeImageThresholdPx {
+		return true
+	}
+	if hOK && hpx >= largeImageThresholdPx {
+		return true
 	}
 
-	if image.Height != "" {
-		if strings.HasSuffix(image.Height, "px") {
-			heightStr := strings.TrimSuffix(image.Height, "px")
-			if len(heightStr) >= 3 { // 3+ digit height (100px+)
-				return true
-			}
-		}
+	// If we had a usable dimension but it was below threshold, it's small.
+	if wOK || hOK {
+		return false
 	}
 
-	// Default to considering it large if no size info available
+	// No usable size info: default to large.
 	return true
+}
+
+// parsePixelDimension parses an HTML dimension like "150", "150px", or " 150 "
+// into its integer pixel value. It returns ok=false for empty, percentage,
+// or otherwise non-pixel/unparseable values.
+func parsePixelDimension(dim string) (int, bool) {
+	s := strings.TrimSpace(dim)
+	if s == "" || strings.HasSuffix(s, "%") {
+		return 0, false
+	}
+	s = strings.TrimSuffix(s, "px")
+	s = strings.TrimSpace(s)
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }

@@ -292,7 +292,7 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("crawler.max_depth", 5)
 	v.SetDefault("crawler.concurrent_workers", 10)
 	v.SetDefault("crawler.request_timeout", "30s")
-	v.SetDefault("crawler.user_agent", "LLMCrawler/1.0 (+https://github.com/Almahr1/quert)")
+	v.SetDefault("crawler.user_agent", "LLMCrawler/1.0 (+https://github.com/cyberpsych0s1s/quert)")
 	v.SetDefault("crawler.global_rate_limit", 5.0)
 	v.SetDefault("crawler.global_burst", 10)
 	v.SetDefault("crawler.per_host_rate_limit", 3.0)

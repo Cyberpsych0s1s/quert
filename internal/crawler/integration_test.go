@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Almahr1/quert/internal/config"
+	"github.com/cyberpsych0s1s/quert/internal/config"
 	"go.uber.org/zap"
 )
 

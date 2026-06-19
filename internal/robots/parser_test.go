@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Almahr1/quert/internal/client"
+	"github.com/cyberpsych0s1s/quert/internal/client"
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"

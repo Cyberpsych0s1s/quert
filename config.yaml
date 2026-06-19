@@ -1,23 +1,26 @@
-# Test configuration file for unit tests
+# Quert crawler configuration.
+# This is the default config loaded from ./config.yaml. Override any field via
+# the -config flag, environment variables (CRAWLER_*), or CLI flags.
 crawler:
   max_pages: 1000
   max_depth: 3
   concurrent_workers: 4
   request_timeout: 15s
-  user_agent: "TestCrawler/1.0 (+https://github.com/test/crawler)"
+  user_agent: "Quert/1.0 (+https://github.com/cyberpsych0s1s/quert)"
+  # Starting URLs. Override with -seed on the command line.
   seed_urls:
     - "https://example.com"
-    - "https://test.com"
-  include_patterns:
-    - ".*\\.html"
-    - ".*\\.php"
+  # include_patterns: if non-empty, a URL must match one of these regexes to be
+  # crawled. Empty means "no include filter" (crawl anything not excluded).
+  include_patterns: []
+  # exclude_patterns: URLs matching any of these regexes are skipped.
   exclude_patterns:
-    - ".*\\.(jpg|jpeg|png|gif|pdf)"
-  allowed_domains:
-    - "example.com"
-    - "test.com"
-  blocked_domains:
-    - "spam.com"
+    - ".*\\.(jpg|jpeg|png|gif|pdf|zip|mp4|mp3)$"
+  # allowed_domains: if non-empty, restrict the crawl to these domains. Empty
+  # means follow links to any domain (bounded by max_depth / max_pages).
+  allowed_domains: []
+  # blocked_domains: never crawl these domains.
+  blocked_domains: []
   global_rate_limit: 10.0
   global_burst: 15
   per_host_rate_limit: 5.0

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Almahr1/quert/internal/storage/memory"
+	"github.com/cyberpsych0s1s/quert/internal/storage/memory"
 	"github.com/stretchr/testify/assert"
 )
 

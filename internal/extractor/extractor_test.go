@@ -236,7 +236,7 @@ func TestContentQualityFiltering(t *testing.T) {
 
 	_, err := factory.ExtractContent([]byte(shortContent), "text/html", "https://test.com")
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "quality score")
+	assert.ErrorIs(t, err, ErrQualityBelowThreshold)
 
 	// Longer content that should pass
 	longContent := `<html><head><title>Comprehensive Article About Web Crawling</title><meta name="description" content="This is a comprehensive article about web crawling techniques"><meta name="author" content="Test Author"></head><body>` +

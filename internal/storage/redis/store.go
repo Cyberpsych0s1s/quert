@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Almahr1/quert/internal/storage"
+	"github.com/cyberpsych0s1s/quert/internal/storage"
 	"github.com/redis/go-redis/v9"
 )
 

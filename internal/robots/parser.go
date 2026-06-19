@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Almahr1/quert/internal/client"
-	"github.com/Almahr1/quert/internal/frontier"
+	"github.com/cyberpsych0s1s/quert/internal/client"
+	"github.com/cyberpsych0s1s/quert/internal/frontier"
 	"github.com/temoto/robotstxt"
 )
 

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/PuerkitoBio/goquery"
 	"go.uber.org/zap"
@@ -307,7 +308,12 @@ func (h *HTMLContentExtractor) ExtractMainContent(doc *goquery.Document) (string
 	var bestMethod string
 	var bestScore float64
 
-	// Remove boilerplate content first
+	// Strip non-content elements first. Without this, inline <style>/<script>
+	// inside the matched content subtree (e.g. Wikipedia's <style> blocks inside
+	// <main>) leak their CSS/JS source into the extracted text.
+	doc.Find("script, style, noscript, template").Remove()
+
+	// Remove boilerplate content next
 	if h.Config.RemoveBoilerplate {
 		h.RemoveBoilerplateContent(doc)
 	}
@@ -405,12 +411,33 @@ func (h *HTMLContentExtractor) CleanTextContent(text string) string {
 		text = strings.TrimSpace(text)
 	}
 
-	if h.Config.MaxTextLength > 0 && len(text) > h.Config.MaxTextLength {
-		text = text[:h.Config.MaxTextLength]
+	if h.Config.MaxTextLength > 0 {
+		text = truncateRunes(text, h.Config.MaxTextLength)
 	}
 
 	return text
 }
+
+// truncateRunes returns s limited to at most maxRunes runes without splitting a
+// multi-byte UTF-8 rune. maxRunes <= 0 returns s unchanged. Length limits in the
+// extractor are character counts, not byte counts; slicing on bytes corrupts the
+// trailing rune of multi-byte (non-ASCII) text.
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return s
+	}
+	count := 0
+	for i := range s {
+		if count == maxRunes {
+			return s[:i]
+		}
+		count++
+	}
+	return s
+}
+
+// runeLen reports the number of runes (characters) in s.
+func runeLen(s string) int { return utf8.RuneCountInString(s) }
 
 // ScoreContentByLength scores content based on length and structure
 func (h *HTMLContentExtractor) ScoreContentByLength(content string) float64 {

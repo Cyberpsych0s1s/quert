@@ -132,8 +132,8 @@ func (x *XMLContentExtractor) ExtractTitleFromXMLText(text string) string {
 	}
 
 	// Fallback to first 50 characters
-	if len(text) > 50 {
-		return strings.TrimSpace(text[:50]) + "..."
+	if runeLen(text) > 50 {
+		return strings.TrimSpace(truncateRunes(text, 50)) + "..."
 	}
 
 	return strings.TrimSpace(text)
@@ -158,8 +158,8 @@ func (x *XMLContentExtractor) CleanXMLText(text string) string {
 	}
 
 	// Apply length constraints
-	if x.Config.MaxTextLength > 0 && len(cleaned) > x.Config.MaxTextLength {
-		cleaned = cleaned[:x.Config.MaxTextLength]
+	if x.Config.MaxTextLength > 0 {
+		cleaned = truncateRunes(cleaned, x.Config.MaxTextLength)
 	}
 
 	return cleaned
@@ -254,8 +254,8 @@ func (x *XMLContentExtractor) CreateXMLMetadataFromDoc(doc *goquery.Document, te
 		desc := doc.Find(selector).First().Text()
 		if desc != "" {
 			metadata.Description = strings.TrimSpace(desc)
-			if len(metadata.Description) > 500 {
-				metadata.Description = metadata.Description[:500] + "..."
+			if runeLen(metadata.Description) > 500 {
+				metadata.Description = truncateRunes(metadata.Description, 500) + "..."
 			}
 			break
 		}
@@ -271,8 +271,8 @@ func (x *XMLContentExtractor) CreateDescriptionFromText(text string) string {
 	}
 
 	// Use first 200 characters as description
-	if len(text) > 200 {
-		return strings.TrimSpace(text[:200]) + "..."
+	if runeLen(text) > 200 {
+		return strings.TrimSpace(truncateRunes(text, 200)) + "..."
 	}
 
 	return strings.TrimSpace(text)

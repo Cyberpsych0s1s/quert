@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Almahr1/quert/internal/config"
+	"github.com/cyberpsych0s1s/quert/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"

@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/Almahr1/quert/internal/storage"
+	"github.com/cyberpsych0s1s/quert/internal/storage"
 )
 
 type Store struct {

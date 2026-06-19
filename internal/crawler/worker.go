@@ -8,15 +8,16 @@ import (
 	"math/rand"
 	"net/http"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/Almahr1/quert/internal/client"
-	"github.com/Almahr1/quert/internal/config"
-	"github.com/Almahr1/quert/internal/extractor"
-	"github.com/Almahr1/quert/internal/frontier"
-	"github.com/Almahr1/quert/internal/robots"
+	"github.com/cyberpsych0s1s/quert/internal/client"
+	"github.com/cyberpsych0s1s/quert/internal/config"
+	"github.com/cyberpsych0s1s/quert/internal/extractor"
+	"github.com/cyberpsych0s1s/quert/internal/frontier"
+	"github.com/cyberpsych0s1s/quert/internal/robots"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
@@ -27,6 +28,7 @@ type CrawlJob struct {
 	URLInfo     *frontier.URLInfo
 	Priority    int
 	Depth       int
+	Attempt     int // coordinator-level retry attempt (0 = first try)
 	Headers     map[string]string
 	RequestID   string
 	SubmittedAt time.Time
@@ -84,11 +86,12 @@ type CrawlerEngine struct {
 	// HTTP and external dependencies
 	HTTPClient       *client.HTTPClient
 	RobotsParser     *robots.Parser
+	RobotsEnabled    bool
 	ExtractorFactory *extractor.ExtractorFactory
 
 	// Rate limiting
 	GlobalLimiter *rate.Limiter
-	HostLimiters  map[string]*rate.Limiter
+	HostLimiters  map[string]*hostLimiter
 	LimiterMutex  sync.RWMutex
 
 	// Lifecycle management
@@ -160,7 +163,7 @@ func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, rob
 	}
 
 	if crawlerConfig.UserAgent == "" {
-		crawlerConfig.UserAgent = "Quert/1.0 (+https://github.com/Almahr1/quert)"
+		crawlerConfig.UserAgent = "Quert/1.0 (+https://github.com/cyberpsych0s1s/quert)"
 		logger.Info("using default user agent", zap.String("user_agent", crawlerConfig.UserAgent))
 	}
 
@@ -262,7 +265,7 @@ func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, rob
 	GlobalLimiter := rate.NewLimiter(rate.Limit(GlobalRateLimit), GlobalBurst)
 
 	// Per-host rate limiters map (will be populated dynamically)
-	HostLimiters := make(map[string]*rate.Limiter)
+	HostLimiters := make(map[string]*hostLimiter)
 
 	logger.Info("initialized rate limiters",
 		zap.Float64("global_rate_limit", float64(GlobalLimiter.Limit())),
@@ -309,6 +312,7 @@ func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, rob
 		// HTTP and external dependencies
 		HTTPClient:       httpClient,
 		RobotsParser:     robotsParser,
+		RobotsEnabled:    robotsCfg == nil || robotsCfg.Enabled,
 		ExtractorFactory: extractorFactory,
 
 		// Rate limiting
@@ -392,18 +396,22 @@ func (CrawlerEngine *CrawlerEngine) Stop() error {
 		return fmt.Errorf("crawler engine is not running")
 	}
 
-	CrawlerEngine.RunningMutex.Lock()
-	CrawlerEngine.Running = false
-	CrawlerEngine.RunningMutex.Unlock()
-
 	CrawlerEngine.Logger.Info("stopping crawler engine gracefully")
 
 	if CrawlerEngine.Cancel != nil {
 		CrawlerEngine.Cancel()
 	}
 
+	// Mark not-running and close the Jobs channel atomically with respect to
+	// SubmitJob. Submitters take RLock around their send and re-check Running,
+	// so taking the write lock here guarantees no send can race with the close
+	// (which would otherwise panic). Cancel() above unblocks any submitter
+	// parked on a full Jobs buffer via the engine context.
+	CrawlerEngine.RunningMutex.Lock()
+	CrawlerEngine.Running = false
 	remainingJobs := len(CrawlerEngine.Jobs)
 	close(CrawlerEngine.Jobs)
+	CrawlerEngine.RunningMutex.Unlock()
 
 	workerDone := make(chan struct{})
 	go func() {
@@ -479,16 +487,21 @@ func (CrawlerEngine *CrawlerEngine) SubmitJob(Job *CrawlJob) error {
 		return fmt.Errorf("failed to extract host from URL: %w", ExtractErr)
 	}
 
-	PermissionResult, RobotsErr := CrawlerEngine.RobotsParser.IsAllowed(Job.Context, Job.URL)
-	if RobotsErr != nil {
-		CrawlerEngine.Logger.Warn("robots.txt check failed, allowing by default",
-			zap.String("url", Job.URL),
-			zap.Error(RobotsErr))
-	} else if !PermissionResult.Allowed {
-		return fmt.Errorf("URL disallowed by robots.txt: %s", Job.URL)
+	HostLimiter := CrawlerEngine.GetRateLimiter(HostFromURL)
+
+	if CrawlerEngine.RobotsEnabled {
+		PermissionResult, RobotsErr := CrawlerEngine.RobotsParser.IsAllowed(Job.Context, Job.URL)
+		if RobotsErr != nil {
+			CrawlerEngine.Logger.Warn("robots.txt check failed, allowing by default",
+				zap.String("url", Job.URL),
+				zap.Error(RobotsErr))
+		} else if !PermissionResult.Allowed {
+			return fmt.Errorf("URL disallowed by robots.txt: %s", Job.URL)
+		} else {
+			CrawlerEngine.applyCrawlDelay(HostFromURL, PermissionResult.CrawlDelay)
+		}
 	}
 
-	HostLimiter := CrawlerEngine.GetRateLimiter(HostFromURL)
 	if GlobalErr := CrawlerEngine.GlobalLimiter.Wait(Job.Context); GlobalErr != nil {
 		return fmt.Errorf("global rate limit wait failed: %w", GlobalErr)
 	}
@@ -496,10 +509,23 @@ func (CrawlerEngine *CrawlerEngine) SubmitJob(Job *CrawlJob) error {
 		return fmt.Errorf("host rate limit wait failed: %w", HostErr)
 	}
 
+	// Hold RLock across the send and re-check Running so the send cannot race
+	// with Stop() closing the Jobs channel. Select on the engine context too,
+	// so a submitter parked on a full buffer is released when Stop cancels.
+	CrawlerEngine.RunningMutex.RLock()
+	if !CrawlerEngine.Running {
+		CrawlerEngine.RunningMutex.RUnlock()
+		return fmt.Errorf("crawler engine is not running")
+	}
 	select {
 	case CrawlerEngine.Jobs <- Job:
+		CrawlerEngine.RunningMutex.RUnlock()
 	case <-Job.Context.Done():
+		CrawlerEngine.RunningMutex.RUnlock()
 		return Job.Context.Err()
+	case <-CrawlerEngine.Ctx.Done():
+		CrawlerEngine.RunningMutex.RUnlock()
+		return fmt.Errorf("crawler engine is shutting down")
 	}
 
 	atomic.AddInt64(&CrawlerEngine.TotalJobs, 1)
@@ -667,11 +693,6 @@ func (CrawlerEngine *CrawlerEngine) Worker(Context context.Context, WorkerID int
 			zap.Int("worker_id", WorkerID))
 	}()
 
-	timer := time.NewTimer(0)
-	if !timer.Stop() {
-		<-timer.C // drain
-	}
-
 	for {
 		select {
 		case <-Context.Done():
@@ -705,21 +726,15 @@ func (CrawlerEngine *CrawlerEngine) Worker(Context context.Context, WorkerID int
 
 			CrawlerEngine.UpdateWorkerStats(WorkerID, Job, Result)
 
-			timer.Reset(5 * time.Second)
+			// Deliver the result. Block until it is accepted or the engine is
+			// shutting down — never drop a completed result on a timeout, which
+			// would silently lose crawled data and misreport the crawl as
+			// complete. Backpressure here correctly slows workers when the
+			// result consumer falls behind.
 			select {
 			case CrawlerEngine.Results <- Result:
-				if !timer.Stop() {
-					<-timer.C
-				}
 			case <-Context.Done():
-				if !timer.Stop() {
-					<-timer.C
-				}
 				return
-			case <-timer.C:
-				CrawlerEngine.Logger.Warn("timeout sending result to results channel",
-					zap.Int("worker_id", WorkerID),
-					zap.String("url", Job.URL))
 			}
 
 			CrawlerEngine.StatsMutex.Lock()
@@ -748,18 +763,6 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 		Retryable:   false,
 	}
 
-	PermissionResult, RobotsErr := CrawlerEngine.RobotsParser.IsAllowed(Context, Job.URL)
-	if RobotsErr != nil {
-		CrawlerEngine.Logger.Warn("robots.txt check failed during processing",
-			zap.String("url", Job.URL),
-			zap.Error(RobotsErr))
-	} else if !PermissionResult.Allowed {
-		Result.Error = fmt.Errorf("URL disallowed by robots.txt: %s", Job.URL)
-		Result.Retryable = false
-		Result.ResponseTime = time.Since(StartTime)
-		return Result
-	}
-
 	HostFromURL, ExtractErr := frontier.ExtractHostFromURL(Job.URL)
 	if ExtractErr != nil {
 		Result.Error = fmt.Errorf("failed to extract host from URL: %w", ExtractErr)
@@ -769,6 +772,23 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 	}
 
 	HostLimiter := CrawlerEngine.GetRateLimiter(HostFromURL)
+
+	if CrawlerEngine.RobotsEnabled {
+		PermissionResult, RobotsErr := CrawlerEngine.RobotsParser.IsAllowed(Context, Job.URL)
+		if RobotsErr != nil {
+			CrawlerEngine.Logger.Warn("robots.txt check failed during processing",
+				zap.String("url", Job.URL),
+				zap.Error(RobotsErr))
+		} else if !PermissionResult.Allowed {
+			Result.Error = fmt.Errorf("URL disallowed by robots.txt: %s", Job.URL)
+			Result.Retryable = false
+			Result.ResponseTime = time.Since(StartTime)
+			return Result
+		} else {
+			CrawlerEngine.applyCrawlDelay(HostFromURL, PermissionResult.CrawlDelay)
+		}
+	}
+
 	if HostErr := HostLimiter.Wait(Context); HostErr != nil {
 		Result.Error = fmt.Errorf("host rate limit wait failed: %w", HostErr)
 		Result.Retryable = true
@@ -780,7 +800,12 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 	if HTTPErr != nil {
 		if errors.Is(HTTPErr, context.DeadlineExceeded) || errors.Is(HTTPErr, context.Canceled) {
 			atomic.AddInt64(&CrawlerEngine.TimedOutJobs, 1)
-			return nil
+			// Still emit a result so callers tracking one-result-per-job (the
+			// discovery coordinator) stay balanced and the timeout is observable.
+			Result.Error = fmt.Errorf("request timed out or cancelled: %w", HTTPErr)
+			Result.Retryable = true
+			Result.ResponseTime = time.Since(StartTime)
+			return Result
 		}
 		Result.Error = fmt.Errorf("HTTP request failed: %w", HTTPErr)
 		Result.Retryable = CrawlerEngine.IsRetryableHTTPError(HTTPErr)
@@ -815,9 +840,23 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 			zap.String("url", Job.URL),
 			zap.Error(ExtractionErr))
 
-		Result.Links = []string{}
 		Result.ExtractedText = ""
 		Result.ExtractedContent = nil
+
+		// A quality rejection means the page parsed fine but scored too low to
+		// keep. Its links are still valuable for discovery (index/hub pages are
+		// often low-text, high-link), so harvest them separately. A genuine
+		// parse failure yields no links.
+		Result.Links = []string{}
+		if errors.Is(ExtractionErr, extractor.ErrQualityBelowThreshold) {
+			if links, linkErr := CrawlerEngine.ExtractorFactory.ExtractLinks(BodyBytes, Result.ContentType, Job.URL); linkErr == nil {
+				urls := make([]string, len(links))
+				for i, l := range links {
+					urls[i] = l.URL
+				}
+				Result.Links = urls
+			}
+		}
 	} else {
 		Result.ExtractedContent = ExtractedContent
 		Result.ExtractedText = ExtractedContent.CleanText
@@ -886,7 +925,7 @@ func (CrawlerEngine *CrawlerEngine) ResultProcessor(Context context.Context) {
 						CrawlerEngine.Logger.Info("results channel closed, result processor exiting")
 						return
 					}
-					CrawlerEngine.handleResultRouting(Result)
+					CrawlerEngine.handleResultRouting(Context, Result)
 				case <-drainTimer.C:
 					CrawlerEngine.Logger.Warn("timeout draining results, forcing shutdown")
 					return
@@ -900,26 +939,23 @@ func (CrawlerEngine *CrawlerEngine) ResultProcessor(Context context.Context) {
 				return
 			}
 
-			CrawlerEngine.handleResultRouting(Result)
+			CrawlerEngine.handleResultRouting(Context, Result)
 		}
 	}
 }
 
 // handleResultRouting processes the result internally and forwards it to the user
-func (CrawlerEngine *CrawlerEngine) handleResultRouting(Result *CrawlResult) {
+func (CrawlerEngine *CrawlerEngine) handleResultRouting(ctx context.Context, Result *CrawlResult) {
 	// 1. Internal Processing (Stats, logging, retry logic, etc.)
 	CrawlerEngine.ProcessResult(Result)
 
-	// 2. Forward to User
-	// Non-blocking send to prevent stalling the engine if the user (or test) isn't reading fast enough
+	// 2. Forward to user. Block until the consumer accepts it (backpressure)
+	// rather than dropping — a dropped result both loses crawled data and breaks
+	// one-result-per-job accounting in the discovery coordinator. On shutdown the
+	// context is cancelled, so this never blocks forever.
 	select {
 	case CrawlerEngine.UserResults <- Result:
-		// Sent successfully
-	default:
-		// Buffer full, drop result to keep engine running
-		// In a production system, you might want to increase buffer size or warn
-		CrawlerEngine.Logger.Warn("user results channel full, dropping result",
-			zap.String("url", Result.URL))
+	case <-ctx.Done():
 	}
 }
 
@@ -1022,13 +1058,35 @@ func (CrawlerEngine *CrawlerEngine) MetricsCollector(Context context.Context) {
 	}
 }
 
+// hostLimiter wraps a per-host rate limiter with a last-access timestamp so the
+// cleanup goroutine can evict limiters by recency rather than by the unreliable
+// "tokens fully replenished" heuristic.
+type hostLimiter struct {
+	limiter  *rate.Limiter
+	lastUsed atomic.Int64 // UnixNano of last access; updated atomically under RLock
+}
+
+func (h *hostLimiter) touch() { h.lastUsed.Store(time.Now().UnixNano()) }
+
+const (
+	// hostLimiterIdleTTL is how long a host limiter may sit unused before the
+	// cleanup goroutine evicts it.
+	hostLimiterIdleTTL = 15 * time.Minute
+	// maxHostLimiters caps the per-host limiter map to bound memory on broad
+	// crawls touching a very large number of distinct hosts. When the cap is
+	// reached, the least-recently-used entry is evicted on insert so the map
+	// never grows without bound between cleanup ticks.
+	maxHostLimiters = 50000
+)
+
 // GetRateLimiter gets or creates a rate limiter for a specific host
 func (CrawlerEngine *CrawlerEngine) GetRateLimiter(Host string) *rate.Limiter {
 	// Acquire read lock to check if limiter exists
 	CrawlerEngine.LimiterMutex.RLock()
-	if Limiter, exists := CrawlerEngine.HostLimiters[Host]; exists {
+	if hl, exists := CrawlerEngine.HostLimiters[Host]; exists {
+		hl.touch()
 		CrawlerEngine.LimiterMutex.RUnlock()
-		return Limiter
+		return hl.limiter
 	}
 	CrawlerEngine.LimiterMutex.RUnlock()
 
@@ -1037,8 +1095,9 @@ func (CrawlerEngine *CrawlerEngine) GetRateLimiter(Host string) *rate.Limiter {
 	defer CrawlerEngine.LimiterMutex.Unlock()
 
 	// Double-check pattern to avoid race condition
-	if Limiter, exists := CrawlerEngine.HostLimiters[Host]; exists {
-		return Limiter
+	if hl, exists := CrawlerEngine.HostLimiters[Host]; exists {
+		hl.touch()
+		return hl.limiter
 	}
 
 	// Create new rate limiter with host-specific configuration
@@ -1052,22 +1111,85 @@ func (CrawlerEngine *CrawlerEngine) GetRateLimiter(Host string) *rate.Limiter {
 		PerHostBurst = 5 // Default burst of 5 per host if not configured
 	}
 
-	// TODO: Handle rate limit configuration from robots.txt crawl-delay
-	// Check if we should respect crawl-delay from robots.txt
-	// This would override the configured rate limit for this specific host
-	HostLimiter := rate.NewLimiter(rate.Limit(PerHostRateLimit), PerHostBurst)
+	// A robots.txt crawl-delay, when present, is applied on top of this via
+	// applyCrawlDelay (called by SubmitJob/ProcessJob after the robots check),
+	// tightening the limiter to whichever rate is more restrictive.
+	Limiter := rate.NewLimiter(rate.Limit(PerHostRateLimit), PerHostBurst)
+	hl := &hostLimiter{limiter: Limiter}
+	hl.touch()
+
+	// Bound memory: at capacity, evict a batch of the least-recently-used hosts.
+	// Evicting ~10% at once amortizes the O(n log n) scan across many inserts
+	// instead of paying an O(n) scan on every insert past the cap.
+	if len(CrawlerEngine.HostLimiters) >= maxHostLimiters {
+		CrawlerEngine.evictLimitersLocked(maxHostLimiters - maxHostLimiters/10)
+	}
 
 	// Store limiter in map for future use
-	CrawlerEngine.HostLimiters[Host] = HostLimiter
+	CrawlerEngine.HostLimiters[Host] = hl
 
 	CrawlerEngine.Logger.Debug("created new rate limiter for host",
 		zap.String("host", Host),
-		zap.Float64("rate_limit", float64(HostLimiter.Limit())),
-		zap.Int("burst", HostLimiter.Burst()),
+		zap.Float64("rate_limit", float64(Limiter.Limit())),
+		zap.Int("burst", Limiter.Burst()),
 		zap.Float64("configured_per_host_rate", PerHostRateLimit),
 		zap.Int("configured_per_host_burst", PerHostBurst))
 
-	return HostLimiter
+	return Limiter
+}
+
+// applyCrawlDelay honors a robots.txt crawl-delay directive by tightening the
+// host's rate limiter. The effective rate becomes the more restrictive (slower)
+// of the configured per-host rate and 1/crawlDelay, and burst is reduced to 1 so
+// successive requests are actually spaced by the delay. It never loosens an
+// existing limit and is a no-op for a non-positive delay or unknown host.
+func (CrawlerEngine *CrawlerEngine) applyCrawlDelay(host string, delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	delayRate := rate.Limit(1.0 / delay.Seconds())
+
+	CrawlerEngine.LimiterMutex.RLock()
+	hl, ok := CrawlerEngine.HostLimiters[host]
+	CrawlerEngine.LimiterMutex.RUnlock()
+	if !ok {
+		return
+	}
+
+	if hl.limiter.Limit() > delayRate {
+		hl.limiter.SetLimit(delayRate)
+		hl.limiter.SetBurst(1)
+		CrawlerEngine.Logger.Debug("applied robots.txt crawl-delay to host limiter",
+			zap.String("host", host),
+			zap.Duration("crawl_delay", delay),
+			zap.Float64("effective_rate", float64(delayRate)))
+	}
+}
+
+// evictLimitersLocked removes least-recently-used host limiters until at most
+// target remain. The caller must hold LimiterMutex for writing.
+func (CrawlerEngine *CrawlerEngine) evictLimitersLocked(target int) {
+	if target < 0 {
+		target = 0
+	}
+	toRemove := len(CrawlerEngine.HostLimiters) - target
+	if toRemove <= 0 {
+		return
+	}
+
+	type hostAge struct {
+		host string
+		used int64
+	}
+	ages := make([]hostAge, 0, len(CrawlerEngine.HostLimiters))
+	for host, hl := range CrawlerEngine.HostLimiters {
+		ages = append(ages, hostAge{host, hl.lastUsed.Load()})
+	}
+	sort.Slice(ages, func(i, j int) bool { return ages[i].used < ages[j].used })
+
+	for i := 0; i < toRemove && i < len(ages); i++ {
+		delete(CrawlerEngine.HostLimiters, ages[i].host)
+	}
 }
 
 // IsRetryableHTTPError determines if an HTTP error should trigger a retry
@@ -1112,13 +1234,12 @@ func (CrawlerEngine *CrawlerEngine) cleanupRateLimiters(Context context.Context)
 			InitialCount := len(CrawlerEngine.HostLimiters)
 			RemovedCount := 0
 
-			// Remove limiters that haven't been used recently
-			// Simple approach: remove limiters with no recent activity
-			// More sophisticated: track last use time and remove old ones
-			for Host, Limiter := range CrawlerEngine.HostLimiters {
-				// Check if limiter has available tokens (indicating no recent heavy use)
-				// This is a simple heuristic - if burst is fully available, likely unused
-				if Limiter.Tokens() >= float64(Limiter.Burst()) {
+			// Remove limiters not accessed within the idle TTL. Recency is
+			// tracked explicitly via hostLimiter.lastUsed, which is correct
+			// regardless of token replenishment state.
+			cutoff := time.Now().UnixNano() - int64(hostLimiterIdleTTL)
+			for Host, hl := range CrawlerEngine.HostLimiters {
+				if hl.lastUsed.Load() < cutoff {
 					delete(CrawlerEngine.HostLimiters, Host)
 					RemovedCount++
 				}

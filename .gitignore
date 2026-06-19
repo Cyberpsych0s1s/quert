@@ -70,5 +70,5 @@ logs/
 *.backup
 *~
 
-# Private
-private/*
+# Private working files (local only)
+private/

@@ -4,7 +4,6 @@
 BINARY_NAME=crawler
 BINARY_PATH=./bin/$(BINARY_NAME)
 MAIN_PATH=./cmd/crawler
-EXAMPLE_DIR=./examples
 GO_FILES=$(shell find . -name "*.go" -type f -not -path "./vendor/*")
 TEST_TIMEOUT=30s
 
@@ -16,7 +15,7 @@ BUILD_TIME=$(shell date +%Y-%m-%dT%H:%M:%S%z)
 # Go build flags
 LDFLAGS=-ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)"
 
-.PHONY: help build test run clean fmt lint deps dev benchmark coverage profile install-tools examples clean-all test-examples test-all build-examples run-simple-example run-comprehensive-crawler run-basic-crawl test-extractor test-crawler test-robots
+.PHONY: help build test run run-crawl clean fmt lint deps dev benchmark coverage profile install-tools clean-all test-all test-extractor test-crawler test-robots
 
 # Default target
 help: ## Show this help message
@@ -188,42 +187,12 @@ profile-view-mem: profile-mem ## View memory profile
 	go tool pprof profiles/mem.prof
 
 
-# Example targets
-build-examples: ## Build all example binaries
-	@echo "Building example binaries..."
-	@mkdir -p bin/examples
-	@for example in $$(find $(EXAMPLE_DIR) -name "main.go" -type f); do \
-		example_dir=$$(dirname $$example); \
-		example_name=$$(basename $$example_dir); \
-		echo "Building example: $$example_name"; \
-		go build -o bin/examples/$$example_name $$example; \
-	done
-	@echo "Example binaries built in bin/examples/"
+# Run target
+run-crawl: build ## Crawl SEED end-to-end (usage: make run-crawl SEED=https://example.com [OUTPUT=out.jsonl])
+	@echo "Running crawler..."
+	$(BINARY_PATH) -seed "$(SEED)" $(if $(OUTPUT),-output "$(OUTPUT)",) $(if $(CONFIG),-config "$(CONFIG)",)
 
-run-simple-example: ## Run the simple crawler example
-	@echo "Running simple crawler example..."
-	go run $(EXAMPLE_DIR)/simple_example/main.go
-
-run-comprehensive-crawler: ## Run the comprehensive crawler example
-	@echo "Running comprehensive crawler example..."
-	go run $(EXAMPLE_DIR)/comprehensive_crawler/main.go
-
-run-basic-crawl: ## Run the basic crawl example
-	@echo "Running basic crawl example..."
-	go run $(EXAMPLE_DIR)/basic_crawl/main.go
-
-# Testing targets
-test-examples: ## Test all examples compile correctly
-	@echo "Testing examples compile correctly..."
-	@for example in $$(find $(EXAMPLE_DIR) -name "main.go" -type f); do \
-		example_dir=$$(dirname $$example); \
-		example_name=$$(basename $$example_dir); \
-		echo "Testing example: $$example_name"; \
-		go build -o /tmp/test_$$example_name $$example && rm -f /tmp/test_$$example_name; \
-	done
-	@echo "All examples compile successfully!"
-
-test-all: test test-examples ## Run all tests including examples
+test-all: test ## Run all tests
 	@echo "All tests completed successfully!"
 
 # Enhanced test targets
@@ -304,7 +273,7 @@ migrate-down: ## Run database migrations down
 	# Add your rollback command here
 
 # Quick development workflow for current phase
-quick: fmt lint test-all build-examples ## Quick development workflow (format, lint, test all, build examples)
+quick: fmt lint test build ## Quick development workflow (format, lint, test, build)
 	@echo "Quick development workflow completed successfully!"
 
 # Current development focus workflow  
@@ -355,7 +324,7 @@ demo-check: ## Check progress towards working demo
 	@echo "=== Core Crawler (In Progress) ==="
 	@test -f internal/robots/parser.go && echo "✓ Robots.txt handler" || echo "⏳ Needed for demo"
 	@test -f internal/crawler/worker.go && echo "✓ Worker pool" || echo "⏳ Needed for demo"  
-	@test -f internal/extractor/html.go && echo "✓ Content extraction" || echo "⏳ Needed for demo"
+	@test -f internal/extractor/extractor.go && echo "✓ Content extraction" || echo "⏳ Needed for demo"
 	@test -f internal/storage/storage.go && echo "✓ Storage system" || echo "⏳ Needed for demo"
 	@echo ""
 	@echo "📋 Next steps for working demo:"

@@ -1,137 +1,99 @@
-## NOTE:
-* The project is currently undergoing a major refactoring of architecture and documentation, some of the examples may be innacurate to the curent state of the codebase *
-
 # Quert
 
-A (hopefully) performant concurrent web crawler built in Go, designed specifically for collecting text data for LLM training pipelines. Aimed at being ethical and performant, adhering to robots.txt rules, and avoiding super-crazy crawling.
+[![Go Reference](https://pkg.go.dev/badge/github.com/cyberpsych0s1s/quert.svg)](https://pkg.go.dev/github.com/cyberpsych0s1s/quert)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cyberpsych0s1s/quert)](https://goreportcard.com/report/github.com/cyberpsych0s1s/quert)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/cyberpsych0s1s/quert)](go.mod)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://github.com/cyberpsych0s1s/quert/actions/workflows/ci.yml/badge.svg)](https://github.com/cyberpsych0s1s/quert/actions/workflows/ci.yml)
+[![devlog](https://almahri.dev/devlogs/quert/badge.svg)](https://almahri.dev/devlogs/quert/)
+
+A concurrent web crawler in Go for collecting LLM-training data, ethically. Crawls breadth-first, respects robots.txt, rate-limits politely, deduplicates content, and emits clean UTF-8 text as JSONL.
+
+A web crawler built in Go to collect LLM-training data, ethically. It crawls breadth-first and respects robots.txt, rate-limits, it deduplicates content and emits UTF-8 text as JSONL.
+
+> **Status:** In Development. The core features have been completed and tested. See [Project Status](#project-status).
+
+## Features
+
+- **Crawl**: breadth first from seed URLs, is bounded by max depth/pages, priority frontier (seeds → sitemaps → discovered).
+- **robots.txt**: disallow rules + enforced crawl-delay; sitemap seeding (`-sitemap`).
+- **Rate limiting**:  global + per-host token buckets.
+- **Extraction**: HTML, XHTML, XML/RSS/Atom, plain text; main-content selection, boilerplate removal, metadata, quality scoring.
+- **Clean text**: charset detection (no mojibake), rune-safe truncation, `<script>`/`<style>` stripped.
+- **Dedup**: exact (content hash) + near-duplicate (simhash).
+- **Language filtering**, **retries**, **resumable crawls** (`-state`, pair with Redis), **observability** (`-metrics`: JSON + pprof).
+- **JSONL output**: one self-describing JSON object per page.
 
 ## Requirements
 
-- Go 1.23.0 or later
-- See `go.mod` for complete dependency list with versions
+- Go 1.25+ (see `go.mod`).
+- Optional: Redis for persistent/resumable dedup.
 
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/Almahr1/quert.git
+git clone https://github.com/cyberpsych0s1s/quert.git
 cd quert
-go mod download
+go build -o bin/crawler ./cmd/crawler
 ```
 
 ## Usage
 
-** Under Review ** 
-
-### Running Examples
-
-Three example applications are provided:
-
 ```bash
-# Basic crawling demonstration
-make run-basic-crawl
+# Single page
+./bin/crawler -seed "https://example.com" -output out.jsonl
 
-# Simple example with minimal setup
-make run-simple-example
+# Bounded crawl
+./bin/crawler -seed "https://example.com" -max-pages 500 -max-depth 3 -output out.jsonl
 
-# Comprehensive crawler with advanced features
-make run-comprehensive-crawler
+# Sitemap-seeded, resumable, with metrics
+./bin/crawler -seed "https://example.com" -sitemap -state crawl.state -metrics :6060 -output out.jsonl
 ```
+
+Seeds may also come from `crawler.seed_urls` in config; `-seed` overrides. Run `-help` for all flags. Logs go to stderr, so stdout stays clean JSONL.
+
+### Output
+
+One JSON object per line:
+
+```json
+{"url":"https://example.com/page","status_code":200,"title":"Page Title","language":"en","quality_score":0.83,"word_count":742,"link_count":31,"text":"Clean extracted text…","crawled_at":"2026-06-18T12:00:00Z"}
+```
+
+## Library
+
+```go
+cfg, _ := config.LoadConfig("", nil)
+stats, err := quert.CrawlToJSONL(ctx, cfg, []string{"https://example.com"}, os.Stdout, nil)
+```
+
+Custom sink: `quert.Crawl(ctx, cfg, seeds, sinkFn, logger)`. Refer to the full api in [Go docs](https://pkg.go.dev/github.com/cyberpsych0s1s/quert).
 
 ## Configuration
 
-The system accepts configuration through YAML files, environment variables, or programmatic setup. Key configuration sections include:
+Layered: defaults → YAML → env (`CRAWLER_*`) → flags. Sections in `config.yaml`: `crawler`, `http`, `content` (incl. `deduplication`), `robots`, `frontier`, `storage`/`redis`. Sample `config.yaml` included.
 
-- `crawler`: Worker count, depth limits, URL patterns, user agent
-- `http`: Connection pooling, timeouts, compression settings
-- `rate_limit`: Request rates, burst limits, per-host constraints
-- `content`: Quality thresholds, text length limits, extraction settings
+## Ethics
 
-Example configuration file structure is provided in `config.yaml`.
-
-## Content Extraction (Planned)
-
-The extraction system is planned to support multiple content types through a factory pattern:
-
-- **HTML**: Main content extraction, link parsing, metadata extraction
-- **Plain Text**: Basic text processing with quality scoring
-- **XML**: XML/RSS/Atom feed processing
-
-Content quality is assessed using configurable metrics including text length, word count, sentence structure, and language detection.
-
-## Rate Limiting
-
-The crawler implements both global and per-host rate limiting:
-
-- Global rate limiting controls overall request volume
-- Per-host rate limiting ensures compliance with individual site constraints
-- Adaptive rate adjustment responds to server response characteristics
-- Robots.txt crawl-delay directives are automatically respected
+Crawls politely: robots.txt respected, global + per-host rate limits, descriptive `User-Agent` on every request. Disable robots handling only for hosts you own or are permitted to crawl.
 
 ## Testing
 
 ```bash
-# Run all tests
-make test
-
-# Run component-specific tests
-make test-config
-make test-http
-make test-url
-make test-extractor
-make test-crawler
-make test-robots
-
-# Run tests with race detection
-make test-race
+go test ./...          # all
+go test -race ./...    # race detector
 ```
 
-## Development
+Covers crawl loop, extraction, robots, Redis-backed resume, and a 10k-page in-process scale test.
 
-```bash
-# Format code
-make fmt
+## Project Status
 
-# Run linter
-make lint
+**Tested**: full pipeline end-to-end; 10k-page crawl with flat/bounded memory; checkpoint + Redis resume survive restart.
 
-# Build binary
-make build
+**Improving**: throughput/memory under multi-day real-network crawls; extraction is heuristic, not yet readability-class.
 
-# Quick development workflow
-make quick
-```
-
-## Implementation Status
-
-The project is currently in development, I'd estimate around 50% done for now, still working on the actual content extraction which is a major part of the project.
+**Planned**: distributed crawling, higher-quality extraction, more output sinks (object storage, columnar).
 
 ## License
 
-GNU General Public License v3.0
-
-## Dependencies
-
-Core dependencies:
-- `github.com/PuerkitoBio/goquery v1.10.3` - HTML parsing and DOM manipulation
-- `github.com/spf13/viper v1.20.1` - Configuration management
-- `github.com/spf13/pflag v1.0.6` - Command line flags
-- `github.com/temoto/robotstxt v1.1.2` - Robots.txt parsing
-- `go.uber.org/zap v1.27.0` - Structured logging
-- `golang.org/x/time v0.12.0` - Rate limiting primitives
-
-Development dependencies:
-- `github.com/stretchr/testify v1.10.0` - Testing framework
-
-## Development Transparency
-
-This project was built by humans, augmented by AI. I believe in using the best tools for the job:
-
-*   **Human-Led:** The core architecture, design decisions, complex logic, and final implementation were meticulously planned and executed by a human developer.
-*   **AI-Assisted:** To boost productivity, I utilized AI (primarily LLMs) for generating repetitive boilerplate code, comprehensive test cases, and initial drafts of documentation. All AI-generated content was reviewed, tested, and adapted to fit the project's standards. (some room for error, which is reviewed occasionally)
-
-This approach allowed me to focus my creative energy on solving hard problems rather than repetitive tasks.
-
-
-## School Notice:
-
-Currently in school which takes a lot of time away from coding. I will still occasionally work on it from time to time, but issues in the codebase or documentation could take a while before getting fixed.
+Quert uses the Apache 2.0 License. See [`LICENSE`](LICENSE).

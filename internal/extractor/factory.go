@@ -1,11 +1,37 @@
 package extractor
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"go.uber.org/zap"
+	"golang.org/x/net/html/charset"
 )
+
+// ErrQualityBelowThreshold is returned by ExtractContent when extraction
+// succeeded but the content's quality score is below the configured threshold.
+// Callers can use errors.Is to distinguish a quality rejection (the page parsed
+// fine; links are still usable for discovery) from a genuine extraction failure.
+var ErrQualityBelowThreshold = errors.New("content quality below threshold")
+
+// decodeToUTF8 converts content to UTF-8 using the charset declared in the
+// Content-Type header, a byte-order mark, or (for HTML/XML) a <meta charset>
+// sniff of the leading bytes. Non-UTF-8 pages would otherwise be parsed as
+// mojibake. It fails open: on any decode error the original bytes are returned.
+func decodeToUTF8(content []byte, contentType string) []byte {
+	reader, err := charset.NewReader(bytes.NewReader(content), contentType)
+	if err != nil {
+		return content
+	}
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return content
+	}
+	return decoded
+}
 
 // ExtractorFactory creates appropriate content extractors based on content type
 type ExtractorFactory struct {
@@ -61,6 +87,8 @@ func (f *ExtractorFactory) ExtractContent(content []byte, contentType string, so
 		return nil, fmt.Errorf("empty content provided")
 	}
 
+	content = decodeToUTF8(content, contentType)
+
 	extractor := f.CreateExtractor(contentType)
 	defer extractor.Close()
 
@@ -79,8 +107,8 @@ func (f *ExtractorFactory) ExtractContent(content []byte, contentType string, so
 			zap.Float64("quality_score", extractedContent.QualityScore),
 			zap.Float64("threshold", f.Config.QualityThreshold),
 			zap.String("source_url", sourceURL))
-		return nil, fmt.Errorf("content quality score %.2f below threshold %.2f",
-			extractedContent.QualityScore, f.Config.QualityThreshold)
+		return nil, fmt.Errorf("%w: score %.2f < threshold %.2f",
+			ErrQualityBelowThreshold, extractedContent.QualityScore, f.Config.QualityThreshold)
 	}
 
 	f.Logger.Debug("content extracted successfully",
@@ -99,6 +127,8 @@ func (f *ExtractorFactory) ExtractText(content []byte, contentType string) (stri
 		return "", fmt.Errorf("empty content provided")
 	}
 
+	content = decodeToUTF8(content, contentType)
+
 	extractor := f.CreateExtractor(contentType)
 	defer extractor.Close()
 
@@ -115,6 +145,8 @@ func (f *ExtractorFactory) ExtractLinks(content []byte, contentType string, base
 	if len(content) == 0 {
 		return nil, fmt.Errorf("empty content provided")
 	}
+
+	content = decodeToUTF8(content, contentType)
 
 	extractor := f.CreateExtractor(contentType)
 	defer extractor.Close()
