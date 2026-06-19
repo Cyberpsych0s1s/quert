@@ -69,3 +69,6 @@ logs/
 *.bak
 *.backup
 *~
+
+# Private
+private/*
