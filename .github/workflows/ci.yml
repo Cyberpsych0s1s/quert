@@ -56,3 +56,6 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          # compile golangci-lint with this job's Go (1.25) instead of pulling a
+          # prebuilt binary built with an older Go — avoids "build Go < target Go".
+          install-mode: goinstall
