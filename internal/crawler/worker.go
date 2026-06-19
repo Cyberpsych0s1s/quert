@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"sync"
@@ -52,6 +53,11 @@ type CrawlResult struct {
 	CompletedAt      time.Time
 	Success          bool
 	Retryable        bool
+	// FinalURL is the URL the request landed on after following redirects; it
+	// equals URL when there were none. RedirectChain lists the URLs passed
+	// through (excluding the final one), empty if the fetch was direct.
+	FinalURL      string
+	RedirectChain []string
 }
 
 // WorkerStats holds statistics for a worker
@@ -747,6 +753,93 @@ func (CrawlerEngine *CrawlerEngine) Worker(Context context.Context, WorkerID int
 }
 
 // ProcessJob handles the actual crawling of a single URL
+// maxRedirectHops bounds how many redirects a single fetch will follow before
+// giving up, matching net/http.Client's default.
+const maxRedirectHops = 10
+
+// fetchWithRedirects fetches StartURL, following up to maxRedirectHops redirects.
+// Robots permission and the per-host rate limiter are re-checked on every hop,
+// including cross-host redirects, so a redirect can never reach a host we have
+// not cleared. It returns the terminal response (its Body already drained and
+// closed), the body bytes, the final URL landed on, and the chain of URLs passed
+// through (empty when the fetch was direct).
+func (CrawlerEngine *CrawlerEngine) fetchWithRedirects(Context context.Context, StartURL string) (*client.Response, []byte, string, []string, error) {
+	CurrentURL := StartURL
+	var Chain []string
+
+	for hop := 0; hop <= maxRedirectHops; hop++ {
+		Host, ExtractErr := frontier.ExtractHostFromURL(CurrentURL)
+		if ExtractErr != nil {
+			return nil, nil, "", Chain, fmt.Errorf("failed to extract host from URL: %w", ExtractErr)
+		}
+
+		if CrawlerEngine.RobotsEnabled {
+			PermissionResult, RobotsErr := CrawlerEngine.RobotsParser.IsAllowed(Context, CurrentURL)
+			if RobotsErr != nil {
+				CrawlerEngine.Logger.Warn("robots.txt check failed during processing",
+					zap.String("url", CurrentURL),
+					zap.Error(RobotsErr))
+			} else if !PermissionResult.Allowed {
+				return nil, nil, "", Chain, fmt.Errorf("URL disallowed by robots.txt: %s", CurrentURL)
+			} else {
+				CrawlerEngine.applyCrawlDelay(Host, PermissionResult.CrawlDelay)
+			}
+		}
+
+		HostLimiter := CrawlerEngine.GetRateLimiter(Host)
+		if HostErr := HostLimiter.Wait(Context); HostErr != nil {
+			return nil, nil, "", Chain, fmt.Errorf("host rate limit wait failed: %w", HostErr)
+		}
+
+		HTTPResponse, HTTPErr := CrawlerEngine.HTTPClient.Get(Context, CurrentURL)
+		if HTTPErr != nil {
+			return nil, nil, "", Chain, HTTPErr
+		}
+
+		if HTTPResponse.StatusCode >= 300 && HTTPResponse.StatusCode < 400 {
+			Location := HTTPResponse.Header.Get("Location")
+			HTTPResponse.Body.Close()
+			if Location == "" {
+				return nil, nil, "", Chain, fmt.Errorf("redirect status %d with no Location header from %s", HTTPResponse.StatusCode, CurrentURL)
+			}
+			NextURL, ResolveErr := resolveRedirect(CurrentURL, Location)
+			if ResolveErr != nil {
+				return nil, nil, "", Chain, ResolveErr
+			}
+			CrawlerEngine.Logger.Debug("following redirect",
+				zap.String("from", CurrentURL),
+				zap.String("to", NextURL),
+				zap.Int("status", HTTPResponse.StatusCode))
+			Chain = append(Chain, CurrentURL)
+			CurrentURL = NextURL
+			continue
+		}
+
+		BodyBytes, ReadErr := io.ReadAll(HTTPResponse.Body)
+		HTTPResponse.Body.Close()
+		if ReadErr != nil {
+			return nil, nil, "", Chain, fmt.Errorf("failed to read response body: %w", ReadErr)
+		}
+		return HTTPResponse, BodyBytes, CurrentURL, Chain, nil
+	}
+
+	return nil, nil, "", Chain, fmt.Errorf("stopped after %d redirects starting from %s", maxRedirectHops, StartURL)
+}
+
+// resolveRedirect resolves a (possibly relative) Location header against the URL
+// that produced it, returning an absolute URL.
+func resolveRedirect(base, location string) (string, error) {
+	BaseURL, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("parse base url %q: %w", base, err)
+	}
+	LocationURL, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("parse redirect location %q: %w", location, err)
+	}
+	return BaseURL.ResolveReference(LocationURL).String(), nil
+}
+
 func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *CrawlJob, WorkerID int) *CrawlResult {
 	StartTime := time.Now()
 
@@ -763,70 +856,33 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 		Retryable:   false,
 	}
 
-	HostFromURL, ExtractErr := frontier.ExtractHostFromURL(Job.URL)
-	if ExtractErr != nil {
-		Result.Error = fmt.Errorf("failed to extract host from URL: %w", ExtractErr)
-		Result.Retryable = false
-		Result.ResponseTime = time.Since(StartTime)
-		return Result
-	}
-
-	HostLimiter := CrawlerEngine.GetRateLimiter(HostFromURL)
-
-	if CrawlerEngine.RobotsEnabled {
-		PermissionResult, RobotsErr := CrawlerEngine.RobotsParser.IsAllowed(Context, Job.URL)
-		if RobotsErr != nil {
-			CrawlerEngine.Logger.Warn("robots.txt check failed during processing",
-				zap.String("url", Job.URL),
-				zap.Error(RobotsErr))
-		} else if !PermissionResult.Allowed {
-			Result.Error = fmt.Errorf("URL disallowed by robots.txt: %s", Job.URL)
-			Result.Retryable = false
-			Result.ResponseTime = time.Since(StartTime)
-			return Result
-		} else {
-			CrawlerEngine.applyCrawlDelay(HostFromURL, PermissionResult.CrawlDelay)
-		}
-	}
-
-	if HostErr := HostLimiter.Wait(Context); HostErr != nil {
-		Result.Error = fmt.Errorf("host rate limit wait failed: %w", HostErr)
-		Result.Retryable = true
-		Result.ResponseTime = time.Since(StartTime)
-		return Result
-	}
-
-	HTTPResponse, HTTPErr := CrawlerEngine.HTTPClient.Get(Context, Job.URL)
-	if HTTPErr != nil {
-		if errors.Is(HTTPErr, context.DeadlineExceeded) || errors.Is(HTTPErr, context.Canceled) {
+	HTTPResponse, BodyBytes, FinalURL, RedirectChain, FetchErr := CrawlerEngine.fetchWithRedirects(Context, Job.URL)
+	if FetchErr != nil {
+		if errors.Is(FetchErr, context.DeadlineExceeded) || errors.Is(FetchErr, context.Canceled) {
 			atomic.AddInt64(&CrawlerEngine.TimedOutJobs, 1)
 			// Still emit a result so callers tracking one-result-per-job (the
 			// discovery coordinator) stay balanced and the timeout is observable.
-			Result.Error = fmt.Errorf("request timed out or cancelled: %w", HTTPErr)
+			Result.Error = fmt.Errorf("request timed out or cancelled: %w", FetchErr)
 			Result.Retryable = true
 			Result.ResponseTime = time.Since(StartTime)
 			return Result
 		}
-		Result.Error = fmt.Errorf("HTTP request failed: %w", HTTPErr)
-		Result.Retryable = CrawlerEngine.IsRetryableHTTPError(HTTPErr)
+		Result.Error = FetchErr
+		Result.Retryable = CrawlerEngine.IsRetryableHTTPError(FetchErr)
 		Result.ResponseTime = time.Since(StartTime)
 		return Result
 	}
-	defer HTTPResponse.Body.Close()
 
 	Result.StatusCode = HTTPResponse.StatusCode
 	Result.Headers = HTTPResponse.Header
 	Result.ContentType = HTTPResponse.Header.Get("Content-Type")
 	Result.ContentLength = HTTPResponse.ContentLength
 	Result.ResponseTime = time.Since(StartTime)
-
-	BodyBytes, ReadErr := io.ReadAll(HTTPResponse.Body)
-	if ReadErr != nil {
-		Result.Error = fmt.Errorf("failed to read response body: %w", ReadErr)
-		Result.Retryable = true
-		return Result
-	}
 	Result.Body = BodyBytes
+	Result.FinalURL = FinalURL
+	if len(RedirectChain) > 0 {
+		Result.RedirectChain = RedirectChain
+	}
 
 	if HTTPResponse.StatusCode < 200 || HTTPResponse.StatusCode >= 300 {
 		Result.Error = fmt.Errorf("HTTP error status: %d", HTTPResponse.StatusCode)
@@ -834,7 +890,11 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 		return Result
 	}
 
-	ExtractedContent, ExtractionErr := CrawlerEngine.ExtractorFactory.ExtractContent(BodyBytes, Result.ContentType, Job.URL)
+	// Resolve content and links against the final URL so a redirected page's
+	// relative links point at where the page actually lives.
+	BaseURL := FinalURL
+
+	ExtractedContent, ExtractionErr := CrawlerEngine.ExtractorFactory.ExtractContent(BodyBytes, Result.ContentType, BaseURL)
 	if ExtractionErr != nil {
 		CrawlerEngine.Logger.Warn("content extraction failed, continuing without extracted content",
 			zap.String("url", Job.URL),
@@ -849,7 +909,7 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 		// parse failure yields no links.
 		Result.Links = []string{}
 		if errors.Is(ExtractionErr, extractor.ErrQualityBelowThreshold) {
-			if links, linkErr := CrawlerEngine.ExtractorFactory.ExtractLinks(BodyBytes, Result.ContentType, Job.URL); linkErr == nil {
+			if links, linkErr := CrawlerEngine.ExtractorFactory.ExtractLinks(BodyBytes, Result.ContentType, BaseURL); linkErr == nil {
 				urls := make([]string, len(links))
 				for i, l := range links {
 					urls[i] = l.URL
