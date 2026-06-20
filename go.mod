@@ -3,6 +3,7 @@ module github.com/cyberpsych0s1s/quert
 go 1.25.0
 
 require (
+	codeberg.org/readeck/go-readability/v2 v2.1.2
 	github.com/PuerkitoBio/goquery v1.10.3
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/spf13/pflag v1.0.6
@@ -16,6 +17,9 @@ require (
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/go-shiori/dom v0.0.0-20230515143342-73569d674e1c // indirect
+	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f // indirect
+	github.com/itlightning/dateparse v0.2.1 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 )
 

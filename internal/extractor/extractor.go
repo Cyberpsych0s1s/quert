@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"fmt"
 	"html"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	readability "codeberg.org/readeck/go-readability/v2"
 	"github.com/PuerkitoBio/goquery"
 	"go.uber.org/zap"
 )
@@ -203,12 +205,26 @@ func (h *HTMLContentExtractor) ExtractContent(content []byte, contentType string
 
 	// Extract main content based on configuration
 	if h.Config.ExtractMainContent {
-		mainContent, method := h.ExtractMainContent(doc)
-		extractedContent.MainContent = mainContent
-		extractedContent.ExtractionMap["main_content_method"] = method
-
-		// Extract clean text from main content
-		extractedContent.CleanText = h.CleanTextContent(mainContent)
+		// Try readability-class extraction first (DOM scoring, like Mozilla
+		// Readability). It beats selector heuristics on messy real pages. Fall
+		// back to the selector/body path when it yields nothing usable (e.g.
+		// index/hub pages that aren't articles).
+		if text, excerpt, rtitle, ok := h.extractWithReadability(content, sourceURL); ok {
+			extractedContent.MainContent = text
+			extractedContent.CleanText = h.CleanTextContent(text)
+			extractedContent.ExtractionMap["main_content_method"] = "readability"
+			if excerpt != "" {
+				extractedContent.ExtractionMap["excerpt"] = excerpt
+			}
+			if extractedContent.Title == "" && rtitle != "" {
+				extractedContent.Title = rtitle
+			}
+		} else {
+			mainContent, method := h.ExtractMainContent(doc)
+			extractedContent.MainContent = mainContent
+			extractedContent.ExtractionMap["main_content_method"] = method
+			extractedContent.CleanText = h.CleanTextContent(mainContent)
+		}
 	} else {
 		// Extract all text if not focusing on main content
 		allText := h.ExtractAllText(doc)
@@ -300,6 +316,37 @@ func (h *HTMLContentExtractor) ExtractTitle(doc *goquery.Document) string {
 	})
 
 	return strings.TrimSpace(title)
+}
+
+// readabilityMinRunes is the floor below which a readability result is treated
+// as a miss, so the selector/body fallback gets a chance (index/hub pages and
+// very short documents where DOM scoring finds nothing article-shaped).
+const readabilityMinRunes = 40
+
+// extractWithReadability runs readability-class DOM scoring (a Mozilla
+// Readability port) over the raw HTML. It returns the plain-text main content,
+// an excerpt, the detected title, and ok=false when there is no usable result.
+func (h *HTMLContentExtractor) extractWithReadability(content []byte, sourceURL string) (text, excerpt, title string, ok bool) {
+	var parsed *url.URL
+	if sourceURL != "" {
+		parsed, _ = url.Parse(sourceURL)
+	}
+
+	article, err := readability.FromReader(bytes.NewReader(content), parsed)
+	if err != nil || article.Node == nil {
+		return "", "", "", false
+	}
+
+	var buf bytes.Buffer
+	if rerr := article.RenderText(&buf); rerr != nil {
+		return "", "", "", false
+	}
+	text = strings.TrimSpace(buf.String())
+	if utf8.RuneCountInString(text) < readabilityMinRunes {
+		return "", "", "", false
+	}
+
+	return text, strings.TrimSpace(article.Excerpt()), strings.TrimSpace(article.Title()), true
 }
 
 // ExtractMainContent extracts the main content from HTML using content selectors
