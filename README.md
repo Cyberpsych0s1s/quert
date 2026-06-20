@@ -88,11 +88,15 @@ Covers crawl loop, extraction, robots, Redis-backed resume, and a 10k-page in-pr
 
 ## Project Status
 
-**Tested**: full pipeline end-to-end; 10k-page crawl with flat/bounded memory; checkpoint + Redis resume survive restart.
+**Tested**: full pipeline end-to-end; readability-class extraction; prose-shape quality filtering; 10k-page crawl with flat/bounded memory; checkpoint + Redis resume survive restart.
 
-**Improving**: throughput/memory under multi-day real-network crawls; extraction is heuristic, not yet readability-class.
+**Improving**: throughput/memory under multi-day, many-host, real-network crawls.
 
-**Planned**: distributed crawling, higher-quality extraction, more output sinks (object storage, columnar).
+**Planned** (in order):
+1. Multi-day, many-host crawl validation with published numbers.
+2. JavaScript rendering (headless), reach JS/SPA pages an HTTP crawler can't.
+3. Distributed, multi-node crawling.
+4. More output sinks (object storage, columnar formats).
 
 ## License
 
