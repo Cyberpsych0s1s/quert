@@ -51,11 +51,13 @@ func TestCrawlerEngine_SubmitJob(t *testing.T) {
 	engine := setupTestEngine()
 	ctx := context.Background()
 	engine.Start(ctx)
-	defer engine.Stop()
 
 	// Mock robots.txt to be allowed (since engine checks it on submit)
 	httpmock.ActivateNonDefault(engine.HTTPClient.Client)
 	defer httpmock.DeactivateAndReset()
+	// Stop the engine (joins workers) before httpmock resets the transport the
+	// workers read — defers run LIFO, so this must be registered last.
+	defer engine.Stop()
 	httpmock.RegisterResponder("GET", "http://example.com/robots.txt", httpmock.NewStringResponder(404, ""))
 
 	job := &CrawlJob{
@@ -90,6 +92,9 @@ func TestCrawlerEngine_WorkerProcessing(t *testing.T) {
 	)
 
 	engine.Start(ctx)
+	// Registered after the httpmock deactivate defer, so it runs first and joins
+	// the workers before the transport is reset — safe even if an assert fails.
+	defer engine.Stop()
 
 	// Submit Job
 	job := &CrawlJob{URL: "http://example.com/page"}
@@ -107,8 +112,6 @@ func TestCrawlerEngine_WorkerProcessing(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for crawl result")
 	}
-
-	engine.Stop()
 }
 
 func TestCrawlerEngine_RateLimiter(t *testing.T) {
