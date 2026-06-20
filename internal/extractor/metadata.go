@@ -380,96 +380,21 @@ func (h *HTMLContentExtractor) CountParagraphs(doc *goquery.Document) int {
 	return doc.Find("p").Length()
 }
 
-// CalculateQualityScore calculates a quality score for the extracted content
+// CalculateQualityScore scores extracted content 0..1 by prose shape rather than
+// length. The dominant signal is stopword density (genuine prose is full of
+// function words; nav/link-dumps are not), so a terse real post can outscore a
+// long link farm — the opposite of the old length-and-link-count heuristic.
 func (h *HTMLContentExtractor) CalculateQualityScore(extractedContent *ExtractedContent) float64 {
 	if extractedContent == nil {
 		return 0.0
 	}
-
-	var score float64 = 0.0
-	var maxScore float64 = 100.0
-
-	// Content length score (0-25 points)
-	contentLength := len(extractedContent.CleanText)
-	if contentLength >= h.Config.MinTextLength {
-		lengthScore := float64(contentLength) / 2000.0 * 25.0 // Optimal around 2000 chars
-		if lengthScore > 25.0 {
-			lengthScore = 25.0
-		}
-		score += lengthScore
-	}
-
-	// Title presence and quality (0-15 points)
-	if extractedContent.Title != "" {
-		score += 10.0
-		if len(extractedContent.Title) > 10 && len(extractedContent.Title) < 100 {
-			score += 5.0 // Good title length
-		}
-	}
-
-	// Word count score (0-20 points)
-	wordCount := extractedContent.Metadata.WordCount
-	if wordCount > 50 {
-		wordScore := float64(wordCount) / 500.0 * 20.0 // Optimal around 500 words
-		if wordScore > 20.0 {
-			wordScore = 20.0
-		}
-		score += wordScore
-	}
-
-	// Structure score (0-15 points)
-	if extractedContent.Metadata.ParagraphCount > 1 {
-		score += 5.0
-	}
-	if extractedContent.Metadata.SentenceCount > 3 {
-		score += 5.0
-	}
-	if len(extractedContent.Links) > 0 {
-		score += 3.0
-	}
-	if extractedContent.Metadata.Description != "" {
-		score += 2.0
-	}
-
-	// Metadata richness score (0-15 points)
-	metadataScore := 0.0
-	if extractedContent.Metadata.Author != "" {
-		metadataScore += 3.0
-	}
-	if extractedContent.Metadata.PublishedDate != "" {
-		metadataScore += 3.0
-	}
-	if len(extractedContent.Metadata.Keywords) > 0 {
-		metadataScore += 3.0
-	}
-	if len(extractedContent.Metadata.Tags) > 0 {
-		metadataScore += 3.0
-	}
-	if extractedContent.Metadata.Language != "" {
-		metadataScore += 3.0
-	}
-	score += metadataScore
-
-	// Content diversity score (0-10 points)
-	diversityScore := 0.0
-	if len(extractedContent.Images) > 0 {
-		diversityScore += 3.0
-	}
-	if len(extractedContent.Links) > 2 {
-		diversityScore += 4.0
-	}
-	if extractedContent.Metadata.ParagraphCount > 3 {
-		diversityScore += 3.0
-	}
-	score += diversityScore
-
-	// Normalize score to 0-1 range
-	normalizedScore := score / maxScore
-	if normalizedScore > 1.0 {
-		normalizedScore = 1.0
-	}
-
-	return normalizedScore
+	viaReadability := extractedContent.ExtractionMap["main_content_method"] == "readability"
+	return scoreContentQuality(
+		extractedContent.CleanText,
+		viaReadability,
+		extractedContent.Metadata.ParagraphCount,
+		extractedContent.Title != "",
+	)
 }
 
 // ExtractText extracts plain text from HTML content

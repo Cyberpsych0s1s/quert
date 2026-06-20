@@ -535,7 +535,7 @@ func GetDefaultExtractorConfig() *ExtractorConfig {
 		ExtractImages:       true,
 		ExtractMetadata:     true,
 		CalculateQuality:    true,
-		QualityThreshold:    0.7,
+		QualityThreshold:    0.5,
 		ContentSelectors: []ContentSelector{
 			{Name: "main", Selector: "main", Priority: 100},
 			{Name: "article", Selector: "article", Priority: 90},

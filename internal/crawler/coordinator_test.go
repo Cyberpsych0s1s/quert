@@ -557,5 +557,5 @@ func TestExtractorConfigFromContent(t *testing.T) {
 
 	// nil content returns plain defaults.
 	def := ExtractorConfigFromContent(nil)
-	assert.Equal(t, 0.7, def.QualityThreshold)
+	assert.Equal(t, 0.5, def.QualityThreshold)
 }

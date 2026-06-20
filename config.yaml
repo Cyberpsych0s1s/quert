@@ -41,7 +41,7 @@ content:
   min_text_length: 50
   max_text_length: 50000
   languages: ["en", "es", "fr"]
-  quality_threshold: 0.8
+  quality_threshold: 0.5
   remove_boilerplate: true
   extract_main_content: true
   preserve_formatting: false
