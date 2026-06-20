@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -94,6 +93,10 @@ type CrawlerEngine struct {
 	RobotsParser     *robots.Parser
 	RobotsEnabled    bool
 	ExtractorFactory *extractor.ExtractorFactory
+
+	// Fetcher retrieves a URL's content. Defaults to an HTTP fetcher; a headless
+	// (browser) fetcher can be substituted to render JavaScript. See fetcher.go.
+	Fetcher Fetcher
 
 	// Rate limiting
 	GlobalLimiter *rate.Limiter
@@ -340,6 +343,10 @@ func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, rob
 		StartTime:       time.Time{}, // Will be set in Start()
 		MetricsCallback: nil,
 	}
+
+	// Default to the plain HTTP fetcher. A headless fetcher (build-tag gated) can
+	// replace this to render JavaScript without touching the worker pipeline.
+	engine.Fetcher = &httpFetcher{engine: engine}
 
 	logger.Info("crawler engine initialized successfully",
 		zap.Int("workers", crawlerConfig.ConcurrentWorkers),
@@ -757,75 +764,6 @@ func (CrawlerEngine *CrawlerEngine) Worker(Context context.Context, WorkerID int
 // giving up, matching net/http.Client's default.
 const maxRedirectHops = 10
 
-// fetchWithRedirects fetches StartURL, following up to maxRedirectHops redirects.
-// Robots permission and the per-host rate limiter are re-checked on every hop,
-// including cross-host redirects, so a redirect can never reach a host we have
-// not cleared. It returns the terminal response (its Body already drained and
-// closed), the body bytes, the final URL landed on, and the chain of URLs passed
-// through (empty when the fetch was direct).
-func (CrawlerEngine *CrawlerEngine) fetchWithRedirects(Context context.Context, StartURL string) (*client.Response, []byte, string, []string, error) {
-	CurrentURL := StartURL
-	var Chain []string
-
-	for hop := 0; hop <= maxRedirectHops; hop++ {
-		Host, ExtractErr := frontier.ExtractHostFromURL(CurrentURL)
-		if ExtractErr != nil {
-			return nil, nil, "", Chain, fmt.Errorf("failed to extract host from URL: %w", ExtractErr)
-		}
-
-		if CrawlerEngine.RobotsEnabled {
-			PermissionResult, RobotsErr := CrawlerEngine.RobotsParser.IsAllowed(Context, CurrentURL)
-			if RobotsErr != nil {
-				CrawlerEngine.Logger.Warn("robots.txt check failed during processing",
-					zap.String("url", CurrentURL),
-					zap.Error(RobotsErr))
-			} else if !PermissionResult.Allowed {
-				return nil, nil, "", Chain, fmt.Errorf("URL disallowed by robots.txt: %s", CurrentURL)
-			} else {
-				CrawlerEngine.applyCrawlDelay(Host, PermissionResult.CrawlDelay)
-			}
-		}
-
-		HostLimiter := CrawlerEngine.GetRateLimiter(Host)
-		if HostErr := HostLimiter.Wait(Context); HostErr != nil {
-			return nil, nil, "", Chain, fmt.Errorf("host rate limit wait failed: %w", HostErr)
-		}
-
-		HTTPResponse, HTTPErr := CrawlerEngine.HTTPClient.Get(Context, CurrentURL)
-		if HTTPErr != nil {
-			return nil, nil, "", Chain, HTTPErr
-		}
-
-		if HTTPResponse.StatusCode >= 300 && HTTPResponse.StatusCode < 400 {
-			Location := HTTPResponse.Header.Get("Location")
-			HTTPResponse.Body.Close()
-			if Location == "" {
-				return nil, nil, "", Chain, fmt.Errorf("redirect status %d with no Location header from %s", HTTPResponse.StatusCode, CurrentURL)
-			}
-			NextURL, ResolveErr := resolveRedirect(CurrentURL, Location)
-			if ResolveErr != nil {
-				return nil, nil, "", Chain, ResolveErr
-			}
-			CrawlerEngine.Logger.Debug("following redirect",
-				zap.String("from", CurrentURL),
-				zap.String("to", NextURL),
-				zap.Int("status", HTTPResponse.StatusCode))
-			Chain = append(Chain, CurrentURL)
-			CurrentURL = NextURL
-			continue
-		}
-
-		BodyBytes, ReadErr := io.ReadAll(HTTPResponse.Body)
-		HTTPResponse.Body.Close()
-		if ReadErr != nil {
-			return nil, nil, "", Chain, fmt.Errorf("failed to read response body: %w", ReadErr)
-		}
-		return HTTPResponse, BodyBytes, CurrentURL, Chain, nil
-	}
-
-	return nil, nil, "", Chain, fmt.Errorf("stopped after %d redirects starting from %s", maxRedirectHops, StartURL)
-}
-
 // resolveRedirect resolves a (possibly relative) Location header against the URL
 // that produced it, returning an absolute URL.
 func resolveRedirect(base, location string) (string, error) {
@@ -856,7 +794,7 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 		Retryable:   false,
 	}
 
-	HTTPResponse, BodyBytes, FinalURL, RedirectChain, FetchErr := CrawlerEngine.fetchWithRedirects(Context, Job.URL)
+	HTTPResponse, BodyBytes, FinalURL, RedirectChain, FetchErr := CrawlerEngine.Fetcher.Fetch(Context, Job.URL)
 	if FetchErr != nil {
 		if errors.Is(FetchErr, context.DeadlineExceeded) || errors.Is(FetchErr, context.Canceled) {
 			atomic.AddInt64(&CrawlerEngine.TimedOutJobs, 1)
