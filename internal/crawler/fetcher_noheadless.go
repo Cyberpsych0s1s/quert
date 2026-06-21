@@ -12,26 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package storage
+//go:build !headless
 
-import (
-	"context"
-	"errors"
-)
+package crawler
 
-var (
-	ErrNotFound = errors.New("item not found")
-)
+import "errors"
 
-// DeduplicationStore defines the behavior for URL and content deduplication
-type DeduplicationStore interface {
-	IsSeen(ctx context.Context, key string) (bool, error)
-
-	MarkSeen(ctx context.Context, key string) error
-
-	StoreHash(ctx context.Context, hashType string, hash string, url string) error
-
-	GetOriginalURL(ctx context.Context, hashType string, hash string) (string, error)
-
-	Close() error
+// newHeadlessFetcher reports that headless rendering is not compiled in. The real
+// implementation lives in fetcher_headless.go behind the `headless` build tag;
+// building without that tag keeps the binary free of any browser-driver
+// dependency (the single-binary default).
+func newHeadlessFetcher(_ *CrawlerEngine) (Fetcher, error) {
+	return nil, errors.New("javascript rendering requires building with -tags headless")
 }

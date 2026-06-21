@@ -1,3 +1,17 @@
+// Copyright 2026 Omar Almahri and the Quert contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package crawler
 
 import (
@@ -57,6 +71,9 @@ type CrawlResult struct {
 	// through (excluding the final one), empty if the fetch was direct.
 	FinalURL      string
 	RedirectChain []string
+	// Rendered is true when the page was fetched via the headless (JavaScript)
+	// fetcher rather than a plain HTTP GET. Useful provenance for training data.
+	Rendered bool
 }
 
 // WorkerStats holds statistics for a worker
@@ -94,9 +111,16 @@ type CrawlerEngine struct {
 	RobotsEnabled    bool
 	ExtractorFactory *extractor.ExtractorFactory
 
-	// Fetcher retrieves a URL's content. Defaults to an HTTP fetcher; a headless
-	// (browser) fetcher can be substituted to render JavaScript. See fetcher.go.
+	// Fetcher is the default (HTTP) fetcher used for non-rendered pages.
 	Fetcher Fetcher
+
+	// JavaScript rendering. headlessFetcher is non-nil only when rendering is
+	// enabled and a headless fetcher could be constructed (build-tag headless +
+	// browser available). selectFetcher routes per-URL between Fetcher and it.
+	JSRender        *config.JSRenderConfig
+	headlessFetcher Fetcher
+	renderEnabled   bool
+	renderAllowlist map[string]bool // host set; empty = render all hosts
 
 	// Rate limiting
 	GlobalLimiter *rate.Limiter
@@ -142,7 +166,7 @@ type WorkerConfig struct {
 	BackoffStrategy string
 }
 
-func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, robotsCfg *config.RobotsConfig, logger *zap.Logger) *CrawlerEngine {
+func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, robotsCfg *config.RobotsConfig, jsCfg *config.JSRenderConfig, featCfg *config.FeatureConfig, logger *zap.Logger) *CrawlerEngine {
 	if cfg == nil {
 		panic("crawler config cannot be nil")
 	}
@@ -347,6 +371,29 @@ func NewCrawlerEngine(cfg *config.CrawlerConfig, httpCfg *config.HTTPConfig, rob
 	// Default to the plain HTTP fetcher. A headless fetcher (build-tag gated) can
 	// replace this to render JavaScript without touching the worker pipeline.
 	engine.Fetcher = &httpFetcher{engine: engine}
+
+	// Set up JavaScript rendering when requested. The headless fetcher only
+	// exists in builds tagged `headless`; without it (or without a browser)
+	// newHeadlessFetcher returns an error and we fall back to HTTP-only, logging
+	// loudly so an operator who asked for rendering is not silently ignored.
+	if featCfg != nil && featCfg.JavaScriptRendering {
+		if jsCfg == nil {
+			jsCfg = &config.JSRenderConfig{}
+		}
+		engine.JSRender = jsCfg
+		engine.renderAllowlist = hostSet(jsCfg.HostAllowlist)
+		hf, err := newHeadlessFetcher(engine)
+		if err != nil {
+			logger.Error("javascript_rendering enabled but headless rendering is unavailable; falling back to HTTP fetch",
+				zap.Error(err))
+		} else {
+			engine.headlessFetcher = hf
+			engine.renderEnabled = true
+			logger.Info("javascript rendering enabled",
+				zap.Int("allowlisted_hosts", len(engine.renderAllowlist)),
+				zap.Duration("render_timeout", jsCfg.RenderTimeout))
+		}
+	}
 
 	logger.Info("crawler engine initialized successfully",
 		zap.Int("workers", crawlerConfig.ConcurrentWorkers),
@@ -794,7 +841,10 @@ func (CrawlerEngine *CrawlerEngine) ProcessJob(Context context.Context, Job *Cra
 		Retryable:   false,
 	}
 
-	HTTPResponse, BodyBytes, FinalURL, RedirectChain, FetchErr := CrawlerEngine.Fetcher.Fetch(Context, Job.URL)
+	fetcher, rendered := CrawlerEngine.selectFetcher(Job.URL)
+	Result.Rendered = rendered
+
+	HTTPResponse, BodyBytes, FinalURL, RedirectChain, FetchErr := fetcher.Fetch(Context, Job.URL)
 	if FetchErr != nil {
 		if errors.Is(FetchErr, context.DeadlineExceeded) || errors.Is(FetchErr, context.Canceled) {
 			atomic.AddInt64(&CrawlerEngine.TimedOutJobs, 1)

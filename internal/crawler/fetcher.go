@@ -1,3 +1,17 @@
+// Copyright 2026 Omar Almahri and the Quert contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package crawler
 
 import (
@@ -95,4 +109,39 @@ func (f *httpFetcher) Fetch(ctx context.Context, startURL string) (*client.Respo
 	}
 
 	return nil, nil, "", Chain, fmt.Errorf("stopped after %d redirects starting from %s", maxRedirectHops, startURL)
+}
+
+// selectFetcher chooses the fetcher for a top-level URL. It returns the headless
+// fetcher (and rendered=true) when rendering is enabled and the URL's host is in
+// the allowlist — or the allowlist is empty, meaning "render every host". It
+// falls back to the HTTP fetcher in every other case, including when the host
+// cannot be parsed. The decision is made once per job; redirects within a render
+// are followed by the chosen fetcher.
+func (e *CrawlerEngine) selectFetcher(rawURL string) (Fetcher, bool) {
+	if !e.renderEnabled || e.headlessFetcher == nil {
+		return e.Fetcher, false
+	}
+	host, err := frontier.ExtractHostFromURL(rawURL)
+	if err != nil {
+		return e.Fetcher, false
+	}
+	if len(e.renderAllowlist) == 0 || e.renderAllowlist[host] {
+		return e.headlessFetcher, true
+	}
+	return e.Fetcher, false
+}
+
+// hostSet builds a lookup set from a list of hosts, dropping blanks. A nil/empty
+// list yields a nil set, which selectFetcher treats as "render every host".
+func hostSet(hosts []string) map[string]bool {
+	if len(hosts) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if h != "" {
+			set[h] = true
+		}
+	}
+	return set
 }

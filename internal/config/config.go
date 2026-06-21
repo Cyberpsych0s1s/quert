@@ -1,3 +1,17 @@
+// Copyright 2026 Omar Almahri and the Quert contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package config provides comprehensive configuration management for the web crawler
 // Supports multiple configuration sources: YAML, JSON, environment variables, and command line flags
 
@@ -33,6 +47,7 @@ type Config struct {
 	Redis          RedisConfig      `mapstructure:"redis" yaml:"redis" json:"redis"`
 	Security       SecurityConfig   `mapstructure:"security" yaml:"security" json:"security"`
 	Features       FeatureConfig    `mapstructure:"features" yaml:"features" json:"features"`
+	JSRender       JSRenderConfig   `mapstructure:"js_render" yaml:"js_render" json:"js_render"`
 	ConfigFileUsed string           `json:"-" yaml:"-"`
 }
 
@@ -199,6 +214,30 @@ type FeatureConfig struct {
 	ContentClassification   bool `mapstructure:"content_classification" yaml:"content_classification" json:"content_classification"`
 	MultiLanguageProcessing bool `mapstructure:"multi_language_processing" yaml:"multi_language_processing" json:"multi_language_processing"`
 	RealTimeStreaming       bool `mapstructure:"real_time_streaming" yaml:"real_time_streaming" json:"real_time_streaming"`
+}
+
+// JSRenderConfig configures optional headless-browser (JavaScript) rendering.
+// Rendering is active only when features.javascript_rendering is set AND the
+// binary was built with -tags headless; otherwise these fields are inert.
+type JSRenderConfig struct {
+	// ChromePath is an explicit path to a Chrome/Chromium/headless-shell binary.
+	// Empty means locate one on PATH.
+	ChromePath string `mapstructure:"chrome_path" yaml:"chrome_path" json:"chrome_path"`
+	// RenderTimeout is the per-page hard cap on rendering.
+	RenderTimeout time.Duration `mapstructure:"render_timeout" yaml:"render_timeout" json:"render_timeout"`
+	// WaitStrategy is when to consider a page "ready": "load", "networkidle", or
+	// "selector" (waits for WaitSelector).
+	WaitStrategy string `mapstructure:"wait_strategy" yaml:"wait_strategy" json:"wait_strategy"`
+	WaitSelector string `mapstructure:"wait_selector" yaml:"wait_selector" json:"wait_selector"`
+	// HostAllowlist restricts rendering to these hosts. Empty means render every
+	// host (when rendering is enabled).
+	HostAllowlist []string `mapstructure:"host_allowlist" yaml:"host_allowlist" json:"host_allowlist"`
+	// BlockResourceTypes are sub-resource types aborted during rendering (e.g.
+	// image, media, font, stylesheet) for speed and politeness.
+	BlockResourceTypes []string `mapstructure:"block_resource_types" yaml:"block_resource_types" json:"block_resource_types"`
+	// MaxSubresources caps sub-requests per rendered page so one page cannot drain
+	// the host's rate budget unbounded.
+	MaxSubresources int `mapstructure:"max_subresources" yaml:"max_subresources" json:"max_subresources"`
 }
 
 func LoadConfig(configPath string, flags *pflag.FlagSet) (*Config, error) {
@@ -404,6 +443,15 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("features.content_classification", true)
 	v.SetDefault("features.multi_language_processing", true)
 	v.SetDefault("features.real_time_streaming", false)
+
+	// JavaScript rendering defaults
+	v.SetDefault("js_render.chrome_path", "")
+	v.SetDefault("js_render.render_timeout", "15s")
+	v.SetDefault("js_render.wait_strategy", "load")
+	v.SetDefault("js_render.wait_selector", "")
+	v.SetDefault("js_render.host_allowlist", []string{})
+	v.SetDefault("js_render.block_resource_types", []string{"image", "media", "font", "stylesheet"})
+	v.SetDefault("js_render.max_subresources", 50)
 }
 
 // validateConfig performs comprehensive validation of the configuration
@@ -580,6 +628,22 @@ func ValidateConfig(config *Config) error {
 		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 			return fmt.Errorf("crawler.seed_urls[%d] must be a valid HTTP/HTTPS URL, got: %s", i, url)
 		}
+	}
+
+	// Validate JavaScript rendering settings (always checked; defaults keep these
+	// valid even when rendering is disabled)
+	validWaitStrategies := map[string]bool{"load": true, "networkidle": true, "selector": true}
+	if !validWaitStrategies[config.JSRender.WaitStrategy] {
+		return fmt.Errorf("invalid js_render.wait_strategy: %s. Valid options: load, networkidle, selector", config.JSRender.WaitStrategy)
+	}
+	if config.JSRender.WaitStrategy == "selector" && config.JSRender.WaitSelector == "" {
+		return fmt.Errorf("js_render.wait_selector is required when js_render.wait_strategy is \"selector\"")
+	}
+	if config.JSRender.RenderTimeout <= 0 {
+		return fmt.Errorf("js_render.render_timeout must be positive, got %v", config.JSRender.RenderTimeout)
+	}
+	if config.JSRender.MaxSubresources < 0 {
+		return fmt.Errorf("js_render.max_subresources must be non-negative, got %d", config.JSRender.MaxSubresources)
 	}
 
 	// Cross-validation: ensure consistent worker and queue settings

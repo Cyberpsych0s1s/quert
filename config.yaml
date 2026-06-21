@@ -135,3 +135,19 @@ features:
   content_classification: true
   multi_language_processing: true
   real_time_streaming: false
+
+# JavaScript / headless rendering. Active only when features.javascript_rendering
+# is true AND the binary was built with -tags headless. Otherwise inert.
+js_render:
+  # Explicit Chrome/Chromium/headless-shell path; empty = locate one on PATH.
+  chrome_path: ""
+  render_timeout: 15s
+  # When a page is "ready": load | networkidle | selector (waits for wait_selector).
+  wait_strategy: "load"
+  wait_selector: ""
+  # Hosts to render. Empty = render every host (when rendering is enabled).
+  host_allowlist: []
+  # Sub-resource types aborted during rendering, for speed and politeness.
+  block_resource_types: ["image", "media", "font", "stylesheet"]
+  # Cap on sub-requests per rendered page (bounds the host's rate budget).
+  max_subresources: 50

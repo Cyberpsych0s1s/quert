@@ -1,3 +1,17 @@
+// Copyright 2026 Omar Almahri and the Quert contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package crawler
 
 import (
@@ -145,7 +159,7 @@ func NewCoordinator(cfg *config.Config, logger *zap.Logger) *Coordinator {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	engine := NewCrawlerEngine(&cfg.Crawler, &cfg.HTTP, &cfg.Robots, logger)
+	engine := NewCrawlerEngine(&cfg.Crawler, &cfg.HTTP, &cfg.Robots, &cfg.JSRender, &cfg.Features, logger)
 	engine.ExtractorFactory = extractor.NewExtractorFactory(ExtractorConfigFromContent(&cfg.Content), logger)
 
 	store := storeFromConfig(cfg, logger)
