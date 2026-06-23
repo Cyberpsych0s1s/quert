@@ -149,5 +149,5 @@ js_render:
   host_allowlist: []
   # Sub-resource types aborted during rendering, for speed and politeness.
   block_resource_types: ["image", "media", "font", "stylesheet"]
-  # Cap on sub-requests per rendered page (bounds the host's rate budget).
+  # Cap on sub-requests per rendered page (bounds the host's rate budget). 0 = unlimited.
   max_subresources: 50

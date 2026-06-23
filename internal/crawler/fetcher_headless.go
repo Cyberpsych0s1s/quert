@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/chromedp/chromedp"
 	"github.com/cyberpsych0s1s/quert/internal/client"
 	"github.com/cyberpsych0s1s/quert/internal/config"
+	"github.com/cyberpsych0s1s/quert/internal/frontier"
 	"go.uber.org/zap"
 )
 
@@ -45,10 +48,12 @@ const browserStartTimeout = 30 * time.Second
 // headlessFetcher renders pages with a headless Chrome via chromedp. One browser
 // process is launched per fetcher and shared across fetches; each Fetch runs in
 // its own tab. Sub-resources are filtered through CDP request interception: the
-// configured resource types are blocked outright and a per-page ceiling bounds
-// the rest. The surviving sub-requests (scripts, XHR) are NOT yet routed through
-// the robots/rate-limit governor — that is the next slice; for now their volume
-// is bounded by the block list and the ceiling.
+// configured resource types are blocked outright, a per-page ceiling bounds the
+// rest, and every surviving sub-request is routed through the engine's politeness
+// governor (per-host rate limit, plus robots for third parties) before it is
+// allowed onto the network — so a rendered page consumes its true share of the
+// host budget. Known gaps: WebSocket/WebRTC egress is not delivered by the Fetch
+// domain and so is not governed here, and the rendered redirect chain is coarse.
 type headlessFetcher struct {
 	engine     *CrawlerEngine
 	cfg        *config.JSRenderConfig
@@ -126,12 +131,18 @@ func (h *headlessFetcher) Fetch(ctx context.Context, startURL string) (*client.R
 		return nil, nil, "", nil, err
 	}
 
-	html, finalURL, err := h.render(ctx, startURL)
+	html, finalURL, status, err := h.render(ctx, startURL)
 	if err != nil {
 		h.engine.Logger.Warn("headless render failed, falling back to HTTP fetch",
 			zap.String("url", startURL),
 			zap.Error(err))
 		return h.engine.Fetcher.Fetch(ctx, startURL)
+	}
+	// render reports 0 when it could not observe the document's HTTP status; treat
+	// that as 200 (the page rendered). A real 4xx/5xx is propagated so ProcessJob
+	// flags it as an HTTP error, matching the plain HTTP fetcher.
+	if status == 0 {
+		status = http.StatusOK
 	}
 
 	var chain []string
@@ -145,29 +156,63 @@ func (h *headlessFetcher) Fetch(ctx context.Context, startURL string) (*client.R
 	header.Set("Content-Type", "text/html; charset=utf-8")
 	body := []byte(html)
 	resp := &client.Response{
-		Response:      &http.Response{StatusCode: http.StatusOK, Header: header, ContentLength: int64(len(body))},
+		Response:      &http.Response{StatusCode: status, Header: header, ContentLength: int64(len(body))},
 		URL:           finalURL,
-		StatusCode:    http.StatusOK,
+		StatusCode:    status,
 		ContentLength: int64(len(body)),
 	}
 	return resp, body, finalURL, chain, nil
 }
 
 // render drives one tab: it enables request interception, navigates, waits per
-// the configured strategy, and serializes the rendered document.
-func (h *headlessFetcher) render(ctx context.Context, startURL string) (string, string, error) {
+// the configured strategy, and serializes the rendered document. It returns the
+// serialized HTML, the final URL, and the main document's HTTP status (0 when it
+// could not be observed, which the caller treats as 200).
+func (h *headlessFetcher) render(ctx context.Context, startURL string) (string, string, int, error) {
 	tabCtx, tabCancel := chromedp.NewContext(h.browserCtx)
 	defer tabCancel() // closes the tab
 
-	// Intercept every request. The handler runs CDP commands, so it must use a
-	// fresh executor and must not block the event loop (hence the goroutine).
-	var subCount int64
+	// Propagate worker/engine cancellation into the tab. The tab is rooted at the
+	// long-lived browser context, so without this a Stop() or per-job deadline
+	// would not abort an in-flight render until RenderTimeout elapsed on its own.
+	defer context.AfterFunc(ctx, tabCancel)()
+
+	// pageHost identifies the page's own origin so its same-origin sub-requests
+	// can be told apart from third-party ones during interception.
+	pageHost, _ := frontier.ExtractHostFromURL(startURL)
+
+	// Interception + main-frame status state. firstDoc lets the top-level
+	// navigation (already governed in Fetch) through once; later document
+	// requests are redirect hops or sub-frame loads and are governed like any
+	// other sub-request.
+	var (
+		subCount  int64
+		firstDoc  int32
+		statusMu  sync.Mutex
+		mainFrame cdp.FrameID
+		status    int
+	)
 	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
-		paused, ok := ev.(*fetch.EventRequestPaused)
-		if !ok {
-			return
+		switch e := ev.(type) {
+		case *fetch.EventRequestPaused:
+			// Handler runs CDP commands, so it needs a fresh executor and must not
+			// block the event loop (hence the goroutine).
+			go h.handlePausedRequest(tabCtx, e, &subCount, &firstDoc, pageHost)
+		case *network.EventResponseReceived:
+			// Track the main frame's document status, following redirects (last
+			// main-frame document response wins); ignore sub-frame documents.
+			if e.Type != network.ResourceTypeDocument || e.Response == nil {
+				return
+			}
+			statusMu.Lock()
+			if mainFrame == "" {
+				mainFrame = e.FrameID
+			}
+			if e.FrameID == mainFrame {
+				status = int(e.Response.Status)
+			}
+			statusMu.Unlock()
 		}
-		go h.handlePausedRequest(tabCtx, paused, &subCount)
 	})
 
 	runCtx := tabCtx
@@ -178,6 +223,7 @@ func (h *headlessFetcher) render(ctx context.Context, startURL string) (string, 
 	}
 
 	actions := []chromedp.Action{
+		network.Enable(),
 		fetch.Enable(),
 		chromedp.Navigate(startURL),
 	}
@@ -197,35 +243,103 @@ func (h *headlessFetcher) render(ctx context.Context, startURL string) (string, 
 	)
 
 	if err := chromedp.Run(runCtx, actions...); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
-	return html, finalURL, nil
+	statusMu.Lock()
+	st := status
+	statusMu.Unlock()
+	return html, finalURL, st, nil
 }
 
-// handlePausedRequest decides the fate of one intercepted request: the main
-// document and surviving sub-resources are continued; configured resource types
-// and anything past the per-page ceiling are aborted.
-//
-// TODO(p2): route the surviving sub-requests through governHop (robots +
-// rate limiter) before continuing them, so rendered pages consume their true
-// share of the host budget. Today they continue ungoverned.
-func (h *headlessFetcher) handlePausedRequest(tabCtx context.Context, ev *fetch.EventRequestPaused, subCount *int64) {
+// handlePausedRequest decides the fate of one intercepted request. The top-level
+// navigation (the first document request, already governed in Fetch) continues
+// straight through. Everything else — redirect hops, sub-frame/iframe documents,
+// and ordinary sub-resources — is blocked by type, capped per page, and routed
+// through the politeness governor before being allowed onto the network.
+func (h *headlessFetcher) handlePausedRequest(tabCtx context.Context, ev *fetch.EventRequestPaused, subCount *int64, firstDoc *int32, pageHost string) {
 	c := chromedp.FromContext(tabCtx)
 	if c == nil || c.Target == nil {
 		return
 	}
 	ectx := cdp.WithExecutor(tabCtx, c.Target)
 
-	switch {
-	case ev.ResourceType == network.ResourceTypeDocument:
+	// The first document request is the top-level navigation; Fetch already
+	// governed it via governHop. Any later document is a redirect or a sub-frame
+	// load and must be governed like a sub-request.
+	if ev.ResourceType == network.ResourceTypeDocument && atomic.CompareAndSwapInt32(firstDoc, 0, 1) {
 		_ = fetch.ContinueRequest(ev.RequestID).Do(ectx)
-	case h.blockTypes[ev.ResourceType]:
-		_ = fetch.FailRequest(ev.RequestID, network.ErrorReasonBlockedByClient).Do(ectx)
-	case h.cfg.MaxSubresources > 0 && atomic.AddInt64(subCount, 1) > int64(h.cfg.MaxSubresources):
-		_ = fetch.FailRequest(ev.RequestID, network.ErrorReasonBlockedByClient).Do(ectx)
-	default:
-		_ = fetch.ContinueRequest(ev.RequestID).Do(ectx)
+		return
 	}
+
+	// Block the configured resource types outright.
+	if h.blockTypes[ev.ResourceType] {
+		_ = fetch.FailRequest(ev.RequestID, network.ErrorReasonBlockedByClient).Do(ectx)
+		return
+	}
+
+	// Enforce the per-page sub-request ceiling (redirect and sub-frame documents
+	// count too).
+	if h.cfg.MaxSubresources > 0 && atomic.AddInt64(subCount, 1) > int64(h.cfg.MaxSubresources) {
+		_ = fetch.FailRequest(ev.RequestID, network.ErrorReasonBlockedByClient).Do(ectx)
+		return
+	}
+
+	// Govern everything else through robots + the per-host rate limiter.
+	var reqURL string
+	if ev.Request != nil {
+		reqURL = ev.Request.URL
+	}
+	if err := h.governSubrequest(tabCtx, reqURL, pageHost); err != nil {
+		_ = fetch.FailRequest(ev.RequestID, network.ErrorReasonBlockedByClient).Do(ectx)
+		return
+	}
+	_ = fetch.ContinueRequest(ev.RequestID).Do(ectx)
+}
+
+// governSubrequest applies politeness to one surviving sub-request before it is
+// allowed onto the network. Every HTTP(S) sub-request is rate-limited by its
+// host using the same per-host limiter as top-level fetches, so a rendered page
+// consumes its true share of the host budget. Third-party (cross-origin)
+// sub-requests are additionally robots-checked and can be blocked; same-origin
+// resources inherit the page's already-granted robots permission and are only
+// throttled — robots-blocking them would break the very page we are allowed to
+// render (e.g. a disallowed /api path the page fetches its data from).
+// Non-HTTP schemes (data:, blob:, about:) are not network fetches and pass
+// through untouched.
+func (h *headlessFetcher) governSubrequest(ctx context.Context, rawURL, pageHost string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil // inline / non-network resource (data:, blob:, about:, ws:) — nothing to govern here
+	}
+	host, err := frontier.ExtractHostFromURL(rawURL)
+	if err != nil {
+		// Governable scheme but unparseable host: fail closed rather than letting
+		// it reach the network ungoverned.
+		return fmt.Errorf("cannot extract host from sub-resource %q: %w", rawURL, err)
+	}
+
+	e := h.engine
+	// Materialize the limiter BEFORE applying any crawl-delay: applyCrawlDelay is a
+	// no-op when the host has no limiter yet, so on the first request to a new host
+	// the robots crawl-delay would otherwise be silently dropped.
+	limiter := e.GetRateLimiter(host)
+	if e.RobotsEnabled && host != pageHost {
+		permission, robotsErr := e.RobotsParser.IsAllowed(ctx, rawURL)
+		switch {
+		case robotsErr != nil:
+			// robots.txt unreachable for a third party. Top-level fetches fail
+			// closed; for a sub-resource we allow but log, so a transient
+			// third-party robots outage does not break the page while the bypass
+			// stays observable.
+			e.Logger.Debug("sub-resource robots check failed, allowing",
+				zap.String("url", rawURL), zap.Error(robotsErr))
+		case !permission.Allowed:
+			return fmt.Errorf("sub-resource disallowed by robots.txt: %s", rawURL)
+		default:
+			e.applyCrawlDelay(host, permission.CrawlDelay)
+		}
+	}
+	return limiter.Wait(ctx)
 }
 
 // blockResourceSet maps the configured resource-type names to CDP resource

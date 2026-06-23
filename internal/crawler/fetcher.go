@@ -104,6 +104,10 @@ func (e *CrawlerEngine) governHop(ctx context.Context, rawURL string) error {
 	if err != nil {
 		return fmt.Errorf("failed to extract host from URL: %w", err)
 	}
+	// Materialize the limiter before applying any crawl-delay: applyCrawlDelay is a
+	// no-op when the host limiter does not exist yet, so doing it first would drop
+	// the robots crawl-delay on the first request to a new host.
+	limiter := e.GetRateLimiter(host)
 	if e.RobotsEnabled {
 		permission, robotsErr := e.RobotsParser.IsAllowed(ctx, rawURL)
 		if robotsErr != nil {
@@ -116,7 +120,7 @@ func (e *CrawlerEngine) governHop(ctx context.Context, rawURL string) error {
 			e.applyCrawlDelay(host, permission.CrawlDelay)
 		}
 	}
-	if err := e.GetRateLimiter(host).Wait(ctx); err != nil {
+	if err := limiter.Wait(ctx); err != nil {
 		return fmt.Errorf("host rate limit wait failed: %w", err)
 	}
 	return nil

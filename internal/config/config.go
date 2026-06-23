@@ -236,7 +236,7 @@ type JSRenderConfig struct {
 	// image, media, font, stylesheet) for speed and politeness.
 	BlockResourceTypes []string `mapstructure:"block_resource_types" yaml:"block_resource_types" json:"block_resource_types"`
 	// MaxSubresources caps sub-requests per rendered page so one page cannot drain
-	// the host's rate budget unbounded.
+	// the host's rate budget unbounded. 0 means unlimited.
 	MaxSubresources int `mapstructure:"max_subresources" yaml:"max_subresources" json:"max_subresources"`
 }
 
