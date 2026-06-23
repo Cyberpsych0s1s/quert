@@ -53,27 +53,8 @@ func (f *httpFetcher) Fetch(ctx context.Context, startURL string) (*client.Respo
 	var Chain []string
 
 	for hop := 0; hop <= maxRedirectHops; hop++ {
-		Host, ExtractErr := frontier.ExtractHostFromURL(CurrentURL)
-		if ExtractErr != nil {
-			return nil, nil, "", Chain, fmt.Errorf("failed to extract host from URL: %w", ExtractErr)
-		}
-
-		if e.RobotsEnabled {
-			PermissionResult, RobotsErr := e.RobotsParser.IsAllowed(ctx, CurrentURL)
-			if RobotsErr != nil {
-				e.Logger.Warn("robots.txt check failed during processing",
-					zap.String("url", CurrentURL),
-					zap.Error(RobotsErr))
-			} else if !PermissionResult.Allowed {
-				return nil, nil, "", Chain, fmt.Errorf("URL disallowed by robots.txt: %s", CurrentURL)
-			} else {
-				e.applyCrawlDelay(Host, PermissionResult.CrawlDelay)
-			}
-		}
-
-		HostLimiter := e.GetRateLimiter(Host)
-		if HostErr := HostLimiter.Wait(ctx); HostErr != nil {
-			return nil, nil, "", Chain, fmt.Errorf("host rate limit wait failed: %w", HostErr)
+		if err := e.governHop(ctx, CurrentURL); err != nil {
+			return nil, nil, "", Chain, err
 		}
 
 		HTTPResponse, HTTPErr := e.HTTPClient.Get(ctx, CurrentURL)
@@ -109,6 +90,36 @@ func (f *httpFetcher) Fetch(ctx context.Context, startURL string) (*client.Respo
 	}
 
 	return nil, nil, "", Chain, fmt.Errorf("stopped after %d redirects starting from %s", maxRedirectHops, startURL)
+}
+
+// governHop applies the politeness gate for a single request to rawURL: the
+// robots.txt permission check (honoring any crawl-delay) and the per-host rate
+// limiter. It returns an error when the host cannot be parsed, the URL is
+// disallowed by robots.txt, or the rate-limiter wait is cancelled. Both the HTTP
+// fetcher (per redirect hop) and the headless fetcher (for the top-level URL)
+// call this before touching a host, so politeness is enforced identically
+// regardless of how a page is fetched.
+func (e *CrawlerEngine) governHop(ctx context.Context, rawURL string) error {
+	host, err := frontier.ExtractHostFromURL(rawURL)
+	if err != nil {
+		return fmt.Errorf("failed to extract host from URL: %w", err)
+	}
+	if e.RobotsEnabled {
+		permission, robotsErr := e.RobotsParser.IsAllowed(ctx, rawURL)
+		if robotsErr != nil {
+			e.Logger.Warn("robots.txt check failed during processing",
+				zap.String("url", rawURL),
+				zap.Error(robotsErr))
+		} else if !permission.Allowed {
+			return fmt.Errorf("URL disallowed by robots.txt: %s", rawURL)
+		} else {
+			e.applyCrawlDelay(host, permission.CrawlDelay)
+		}
+	}
+	if err := e.GetRateLimiter(host).Wait(ctx); err != nil {
+		return fmt.Errorf("host rate limit wait failed: %w", err)
+	}
+	return nil
 }
 
 // selectFetcher chooses the fetcher for a top-level URL. It returns the headless

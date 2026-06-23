@@ -486,6 +486,13 @@ func (CrawlerEngine *CrawlerEngine) Stop() error {
 		CrawlerEngine.Logger.Warn("timeout waiting for workers")
 	}
 
+	// Tear down the headless browser, if one was started, now that no worker can
+	// begin a new render. The headless fetcher implements Close(); the HTTP
+	// fetcher does not, so the type assertion simply skips it.
+	if closer, ok := CrawlerEngine.headlessFetcher.(interface{ Close() }); ok {
+		closer.Close()
+	}
+
 	close(CrawlerEngine.Results)
 
 	waitDone := make(chan struct{})
